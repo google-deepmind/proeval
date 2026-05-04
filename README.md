@@ -51,7 +51,7 @@ You can find the comprehensive [experiment details](./experiment/README.md) and 
 
 ## Citation
 
-If the work did some helps on your research/project, please cite our tech report. Thank you!
+If the work did some helps on your research/project, please cite our ICML 2026 paper. Thank you!
 
 ```
 @article{huang2026proeval,
