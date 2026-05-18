@@ -52,6 +52,8 @@ print(f"Estimated error rate: {result.estimates[-1]:.4f}")
 print(f"MAE: {result.mae(true_mean):.4f}")
 ```
 
+Run the bundled one-click example: `python experiment/sample_usage.py`
+
 ## Experiments
 
 Here is an example of how to run the experiments:
