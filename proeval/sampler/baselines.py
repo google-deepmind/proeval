@@ -18,7 +18,6 @@ Provides BQ active sampling, vanilla BQ, random sampling, IS, and LURE
 baseline methods along with results reporting utilities.
 """
 
-import argparse
 import os
 import random
 from dataclasses import dataclass

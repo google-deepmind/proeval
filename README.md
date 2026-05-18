@@ -14,8 +14,22 @@ Slash GenAI evaluation costs by up to 100x while actively discovering model fail
 
 ## Installation
 
+Install from source as a local Python package:
+
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/google-deepmind/proeval.git
+cd proeval
+pip install -e .
+```
+
+Optional extras:
+
+```bash
+pip install -e ".[encoder]"   # PyTorch — for BQEncoderSampler and encoder training
+pip install -e ".[topics]"    # BERTopic + HDBSCAN — for TopicAwareGenerator
+pip install -e ".[datasets]"  # HuggingFace datasets — for evaluator.load_dataset_data
+pip install -e ".[all]"       # everything above
+pip install -e ".[dev]"       # pytest, ruff, build tooling
 ```
 
 ## Quick Start
