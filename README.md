@@ -70,10 +70,10 @@ You can find the comprehensive [experiment details](./experiment/README.md) and 
 If the work did some helps on your research/project, please cite our ICML 2026 paper. Thank you!
 
 ```
-@article{huang2026proeval,
+@inproceedings{huang2026proeval,
   title={{{ProEval}: Proactive Failure Discovery and Efficient Performance Estimation for Generative AI Evaluation}},
   author={Huang, Yizheng and Zeng, Wenjun and Kumaresan, Aditi and Wang, Zi},
-  journal={arXiv preprint arXiv:2604.23099 [cs.LG]},
+  booktitle={International Conference on Machine Learning (ICML)},
   year={2026},
   url={https://arxiv.org/abs/2604.23099}
 }
