@@ -307,7 +307,61 @@ for i in range(5):
 
 ---
 
-## 3. LLMPredictor — LLM Evaluation
+## 3. Dataset — Bring Your Own Data
+
+`Dataset` bundles **questions + ground truths + a `DatasetConfig`** in a single
+object that the predictor (and, later, the sampler) operates on. Use it whenever
+you want to evaluate models on data that isn't already wired into
+`DATASET_CONFIGS`.
+
+### Constructors
+
+```python
+from proeval import Dataset, DATASET_CONFIGS, LLMPredictor
+
+# (a) Built-in: load one of the 9 datasets shipped with ProEval
+ds = Dataset.from_builtin("svamp")
+
+# (b) From in-memory lists (simplest custom case)
+ds = Dataset.from_lists(
+    name="my_yesno",
+    questions=["Is the sky blue?", "Is fire cold?"],
+    ground_truths=["yes", "no"],
+    prompt_template=lambda q: f"{q} Respond JSON: {{'answer': 'yes'|'no'}}",
+    extract_prediction=lambda d: d["answer"],
+    extract_ground_truth=lambda gt: str(gt).lower(),
+    compare_predictions=lambda p, g: 0.0 if str(p).lower() == g else 1.0,
+)
+
+# (c) From a CSV file
+ds = Dataset.from_csv(
+    "my_data.csv",
+    question_col="question",
+    ground_truth_col="answer",
+    config=DATASET_CONFIGS["strategyqa"],   # reuse an existing config
+)
+```
+
+If you already have a built-in `DatasetConfig` that fits your scoring needs,
+pass it via `config=...` and skip the four eval-function arguments.
+
+### Predict
+
+```python
+predictor = LLMPredictor(model="google/gemma-3-4b-it")
+
+# Either direction works — they're equivalent
+results = ds.predict(predictor, parallel=True, workers=10)
+results = predictor.predict_dataset(ds, parallel=True, workers=10)
+# results: list of (question, ground_truth, raw_response, prediction, score)
+```
+
+`Dataset` also supports `len(ds)`, `ds[i]`, and iteration — returning
+`(question, ground_truth)` tuples.
+
+---
+
+## 4. LLMPredictor — LLM Evaluation
 
 Evaluate LLMs on supported datasets with structured JSON parsing, retry logic, and parallel batching.
 
@@ -445,7 +499,7 @@ csv_mgr.save()                             # Write DataFrame to CSV
 
 ---
 
-## 4. EncoderTrainer — Train a Neural Encoder
+## 5. EncoderTrainer — Train a Neural Encoder
 
 Train a neural encoder for cross-benchmark BQ prior (Setting 1).
 
@@ -494,7 +548,7 @@ Use `--checkpoint-path path/to/encoder.pth` to specify the exact save location.
 
 ---
 
-## 5. Utility Functions
+## 6. Utility Functions
 
 ### Data Loading
 
@@ -540,7 +594,7 @@ resolve_model_name("claude35_sonnet")  # → "anthropic/claude-3.5-sonnet"
 
 ---
 
-## 6. Experiment CLI Scripts
+## 7. Experiment CLI Scripts
 
 All experiment scripts live in `experiment/` and are run as Python modules:
 

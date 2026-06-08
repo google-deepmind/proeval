@@ -41,6 +41,7 @@ __version__ = "0.1.0"
 from proeval.evaluator import DATASET_CONFIGS, DatasetConfig, LLMPredictor, OpenRouterClient
 from proeval.generator import TopicAwareGenerator
 from proeval.sampler import BQPriorSampler, BQSampler, SamplingResult
+from proeval.utils import Dataset
 
 __all__ = [
     "BQPriorSampler",
@@ -49,6 +50,7 @@ __all__ = [
     "TopicAwareGenerator",
     "LLMPredictor",
     "OpenRouterClient",
+    "Dataset",
     "DatasetConfig",
     "DATASET_CONFIGS",
 ]
