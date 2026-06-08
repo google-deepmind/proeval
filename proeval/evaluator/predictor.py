@@ -510,6 +510,30 @@ class LLMPredictor:
             results.append((q, gt, raw, pred if pred is not None else "PARSE_ERROR", score))
         return results
 
+    def predict_dataset(
+        self,
+        dataset,
+        parallel: bool = True,
+        workers: int = 10,
+        max_parse_retries: int = 3,
+        show_progress: bool = True,
+        skip_error: bool = False,
+    ) -> List[Tuple[Any, Any, str, Any, float]]:
+        """Run predictions over a :class:`~proeval.utils.Dataset`.
+
+        Thin convenience wrapper — delegates to
+        :meth:`proeval.utils.Dataset.predict`. Lets callers write
+        ``predictor.predict_dataset(ds)`` instead of ``ds.predict(predictor)``.
+        """
+        return dataset.predict(
+            self,
+            parallel=parallel,
+            workers=workers,
+            max_parse_retries=max_parse_retries,
+            show_progress=show_progress,
+            skip_error=skip_error,
+        )
+
     def predict_batch_parallel(
         self,
         questions: List[str],

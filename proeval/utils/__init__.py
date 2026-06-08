@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ProEval utilities — metrics (no plotting).
+"""ProEval utilities — Dataset wrapper, metrics.
 
 Public API::
 
+    from proeval.utils import Dataset
     from proeval.utils import topic_entropy, embedding_coverage, failure_rate
     from proeval.utils import compute_samples_to_threshold, print_results_table
     from proeval.utils import MODEL_NAME_MAP
 """
 
+from proeval.utils.dataset import Dataset
 from proeval.utils.metrics import (
     compute_all_metrics,
     compute_samples_to_threshold,
@@ -35,6 +37,7 @@ from proeval.utils.metrics import (
 from proeval.utils.model_names import MODEL_NAME_MAP
 
 __all__ = [
+    "Dataset",
     "topic_entropy",
     "embedding_coverage",
     "overall_diversity",
