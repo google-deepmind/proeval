@@ -24,13 +24,22 @@ A :class:`Dataset` bundles three things that travel together during evaluation:
 Use one of the constructors to build a :class:`Dataset`:
 
 - :meth:`Dataset.from_builtin` — one of the 9 datasets shipped with ProEval
-  (``svamp``, ``gsm8k``, ``strategyqa``, ...).
+  (``svamp``, ``gsm8k``, ``strategyqa``, ...). Loads questions/ground_truths
+  from HuggingFace (requires the ``[datasets]`` extra).
+- :meth:`Dataset.from_predictions` — build from a pre-computed
+  ``<name>_predictions.csv``. Offline, and doubles as the bridge to the
+  sampler/generator (carries the prediction matrix + embeddings by name).
 - :meth:`Dataset.from_lists` — pass questions/ground_truths/eval functions
   directly. The simplest way to bring a custom dataset.
 - :meth:`Dataset.from_csv` — load questions and ground truths from a CSV.
 
 Run predictions with :meth:`Dataset.predict` (or
-:meth:`~proeval.evaluator.LLMPredictor.predict_dataset`).
+:meth:`~proeval.evaluator.LLMPredictor.predict_dataset`). A :class:`Dataset`
+can also be passed straight to
+:meth:`~proeval.sampler.BQPriorSampler.sample` and
+:class:`~proeval.generator.TopicAwareGenerator` — see those for the sampling
+side, and :meth:`prediction_matrix` / :meth:`embeddings` for the accessors
+they rely on.
 
 Example — built-in::
 
@@ -93,7 +102,10 @@ class Dataset:
         name: str,
         questions: List[Any],
         ground_truths: List[Any],
-        config: DatasetConfig,
+        config: Optional[DatasetConfig] = None,
+        *,
+        data_dir: Optional[str] = None,
+        predictions_df: Optional["pd.DataFrame"] = None,  # noqa: F821
     ):
         if len(questions) != len(ground_truths):
             raise ValueError(
@@ -103,7 +115,15 @@ class Dataset:
         self.name = name
         self.questions = list(questions)
         self.ground_truths = list(ground_truths)
+        #: Scoring config. Required by :meth:`predict`; optional for datasets
+        #: built only for sampling/generation (e.g. :meth:`from_predictions`).
         self.config = config
+        #: Directory holding ``<name>_predictions.csv`` / ``<name>_embeddings_*``
+        #: used by the sampling accessors. ``None`` → the package ``data/`` dir.
+        self.data_dir = data_dir
+        #: Cached predictions DataFrame, populated when the dataset was built
+        #: from a predictions CSV. ``None`` → resolved lazily by *name*.
+        self._predictions_df = predictions_df
 
     # Container protocol — supports len(), indexing, iteration. This also
     # gives the future sampler a uniform interface to operate on.
@@ -146,6 +166,54 @@ class Dataset:
             questions=questions,
             ground_truths=ground_truths,
             config=DATASET_CONFIGS[name],
+        )
+
+    @classmethod
+    def from_predictions(
+        cls,
+        name: str,
+        data_dir: Optional[str] = None,
+        config: Optional[DatasetConfig] = None,
+    ) -> "Dataset":
+        """Build a Dataset from a pre-computed predictions CSV.
+
+        Loads ``<data_dir>/<name>_predictions.csv`` (the same file the sampler
+        consumes) and uses its ``question`` / ``ground_truth`` columns. The
+        loaded frame is cached, so the sampling accessors
+        (:meth:`predictions`, :meth:`prediction_matrix`, :meth:`embeddings`)
+        resolve without re-reading the file.
+
+        This is the offline bridge between evaluation and sampling: the
+        resulting :class:`Dataset` can be passed directly to
+        ``LLMPredictor`` (if a *config* is available), to
+        :meth:`~proeval.sampler.BQPriorSampler.sample`, and to
+        :class:`~proeval.generator.TopicAwareGenerator`.
+
+        Args:
+            name: Dataset name, e.g. ``"svamp"``. Resolves the CSV by the
+                standard ``<name>_predictions.csv`` convention.
+            data_dir: Directory holding the CSV. ``None`` → package ``data/``.
+            config: Scoring config. ``None`` → ``DATASET_CONFIGS[name]`` when
+                *name* is a built-in dataset, otherwise left unset (sampling
+                still works; :meth:`predict` will require a config).
+        """
+        from proeval.sampler.data import load_predictions
+
+        df = load_predictions(name, data_dir=data_dir)
+        for col in ("question", "ground_truth"):
+            if col not in df.columns:
+                raise ValueError(
+                    f"Predictions CSV for {name!r} is missing a {col!r} column; "
+                    f"found {list(df.columns)[:6]}..."
+                )
+        resolved_config = config if config is not None else DATASET_CONFIGS.get(name)
+        return cls(
+            name=name,
+            questions=df["question"].tolist(),
+            ground_truths=df["ground_truth"].tolist(),
+            config=resolved_config,
+            data_dir=data_dir,
+            predictions_df=df,
         )
 
     @classmethod
@@ -265,6 +333,12 @@ class Dataset:
             score)`` tuples — the same shape as
             :meth:`~proeval.evaluator.LLMPredictor.predict_batch_parallel`.
         """
+        if self.config is None:
+            raise ValueError(
+                f"Dataset {self.name!r} has no scoring config, so it cannot be "
+                "predicted. Build it with a `config=` (or the four eval "
+                "functions), or use a built-in dataset."
+            )
         if parallel:
             return predictor.predict_batch_parallel(
                 self.questions,
@@ -280,6 +354,63 @@ class Dataset:
             self.ground_truths,
             self.config,
             show_progress=show_progress,
+        )
+
+    # Sampling data accessors
+    #
+    # These bridge the Dataset to the sampler/generator. They resolve the
+    # pre-computed prediction CSV / embeddings by *name* (cached when the
+    # dataset was built via from_predictions / from_builtin).
+
+    def predictions(self, data_dir: Optional[str] = None) -> "pd.DataFrame":  # noqa: F821
+        """Return the predictions DataFrame (``label_<model>`` columns).
+
+        Uses the cached frame when available, otherwise loads
+        ``<name>_predictions.csv`` by convention.
+        """
+        if self._predictions_df is not None and data_dir is None:
+            return self._predictions_df
+        from proeval.sampler.data import load_predictions
+
+        df = load_predictions(self.name, data_dir=data_dir or self.data_dir)
+        if data_dir is None:
+            self._predictions_df = df
+        return df
+
+    def prediction_matrix(self, data_dir: Optional[str] = None):
+        """Return ``(prediction_matrix, model_names)`` for this dataset.
+
+        Thin wrapper over
+        :func:`~proeval.sampler.data.extract_model_predictions` that passes
+        *name* so DICES-style continuous labels are binarised correctly.
+        """
+        from proeval.sampler.data import extract_model_predictions
+
+        return extract_model_predictions(self.predictions(data_dir), self.name)
+
+    def embeddings(self, data_dir: Optional[str] = None):
+        """Return pre-computed question embeddings ``(n_samples, d)``.
+
+        Resolves ``<name>_embeddings_*.npy`` by the standard convention.
+        """
+        from proeval.sampler.data import load_embeddings
+
+        return load_embeddings(self.name, data_dir=data_dir or self.data_dir)
+
+    def to_frame(self) -> "pd.DataFrame":  # noqa: F821
+        """Return a DataFrame with ``question`` / ``ground_truth`` columns.
+
+        Returns the cached predictions frame when present (preserving its
+        ``label_<model>`` columns); otherwise builds a minimal frame from the
+        in-memory questions/ground_truths. This is what
+        :class:`~proeval.generator.TopicAwareGenerator` consumes.
+        """
+        if self._predictions_df is not None:
+            return self._predictions_df
+        import pandas as pd
+
+        return pd.DataFrame(
+            {"question": self.questions, "ground_truth": self.ground_truths}
         )
 
 

@@ -173,6 +173,12 @@ python -m experiment.aggregate_results --results-dir results/
 
 End-to-end pipeline: GMM model selection → encoder training → unified experiment → aggregation.
 
+> [!NOTE]
+> The `script/` directory and its `*.sh` wrappers are **not included** in this
+> repository. Run the `python -m experiment.*` commands above directly (section
+> 6 covers the train + sample pipeline). The variables below document the
+> intended wrapper configuration if you recreate it.
+
 ```bash
 # Run all datasets with defaults
 bash script/run_performance_estimation_all.sh
@@ -227,7 +233,9 @@ python -m experiment.exp_run_all_groups --skip-training --n-runs 10
 | `--skip-training` | off | Reuse existing encoder checkpoints |
 
 > [!NOTE]
-> The shell script `run_all_case_2.sh` wraps this command with pre-configured settings.
+> A `run_all_case_2.sh` wrapper for this command is referenced in places but is
+> not included in the repository — invoke `python -m experiment.exp_run_all_groups`
+> directly.
 
 ---
 
@@ -240,8 +248,8 @@ python -m experiment.exp_performance_estimation \
     --encoder-path data/checkpoints/encoder_svamp_new_pair.pth \
     --n-runs 5
 
-# 2. Or use the shell script (GMM → encoder training → experiment → aggregate)
-bash script/run_performance_estimation_all.sh
+# 2. Or run the full train + sample pipeline (GMM → encoder training → sampling)
+python -m experiment.exp_run_all_groups --setting new_pair --n-runs 5
 
 # 3. Failure discovery
 python -m experiment.exp_failure_discovery \

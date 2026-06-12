@@ -68,6 +68,26 @@ from proeval.sampler.data import (
 )
 
 
+def _resolve_predictions(
+    predictions: Union[str, "pd.DataFrame", "Dataset"],  # noqa: F821
+    data_dir: Optional[str] = None,
+) -> Tuple["pd.DataFrame", Optional[str]]:
+    """Normalise the ``predictions`` argument to ``(DataFrame, dataset_name)``.
+
+    Accepts a dataset name (loaded by convention), a pre-loaded DataFrame, or a
+    :class:`~proeval.utils.Dataset` (uses its cached/lazily-loaded predictions
+    and its ``name``). ``dataset_name`` is ``None`` for a bare DataFrame, which
+    disables name-dependent behaviour (GMM selection, DICES label binarisation).
+    """
+    # Local import keeps the sampler import-light and avoids any cycle.
+    from proeval.utils.dataset import Dataset
+
+    if isinstance(predictions, Dataset):
+        return predictions.predictions(data_dir=data_dir), predictions.name
+    if isinstance(predictions, str):
+        return load_predictions(predictions, data_dir=data_dir), predictions
+    return predictions, None
+
 
 # Result container
 @dataclass
@@ -681,7 +701,7 @@ class BQPriorSampler:
 
     def sample(
         self,
-        predictions: Union[str, pd.DataFrame],
+        predictions: Union[str, pd.DataFrame, "Dataset"],  # noqa: F821
         target_model: Union[int, str] = "gemini25_flash",
         budget: int = 50,
         data_dir: str = None,
@@ -693,8 +713,10 @@ class BQPriorSampler:
         """Run BQ active sampling.
 
         Args:
-            predictions: Either a dataset name (e.g., ``"svamp"``) which will be
-                loaded from ``data_dir``, or a pre-loaded DataFrame.
+            predictions: A dataset name (e.g. ``"svamp"``) loaded from
+                ``data_dir``, a pre-loaded DataFrame, or a
+                :class:`~proeval.utils.Dataset` (its ``name`` is used for GMM
+                selection and label binarisation).
             target_model: Index or name of the model to target for testing.
             budget: Number of samples to acquire.
             data_dir: Directory containing prediction CSVs (default: ``data/``).
@@ -715,13 +737,8 @@ class BQPriorSampler:
         if seed is not None:
             np.random.seed(seed)
 
-        # Load data
-        if isinstance(predictions, str):
-            df = load_predictions(predictions, data_dir=data_dir)
-            dataset_name = predictions
-        else:
-            df = predictions
-            dataset_name = None
+        # Load data (accepts a dataset name, a DataFrame, or a Dataset)
+        df, dataset_name = _resolve_predictions(predictions, data_dir)
 
         pred_matrix, model_names = extract_model_predictions(df, dataset_name)
 
@@ -1010,7 +1027,7 @@ class BQEncoderSampler:
 
     def sample(
         self,
-        predictions: Union[str, pd.DataFrame],
+        predictions: Union[str, pd.DataFrame, "Dataset"],  # noqa: F821
         target_model: Union[int, str] = "gemini25_flash",
         budget: int = 50,
         data_dir: str = None,
@@ -1019,7 +1036,8 @@ class BQEncoderSampler:
         """Run BQ active sampling with encoder prior.
 
         Args:
-            predictions: Dataset name or pre-loaded DataFrame.
+            predictions: Dataset name, pre-loaded DataFrame, or a
+                :class:`~proeval.utils.Dataset`.
             target_model: Index or name of the target model.
             budget: Number of samples to acquire.
             data_dir: Data directory path.
@@ -1031,15 +1049,10 @@ class BQEncoderSampler:
         if seed is not None:
             np.random.seed(seed)
 
-        # Load data to get test_y (the target model's labels)
-        if isinstance(predictions, str):
-            df = load_predictions(predictions, data_dir=data_dir)
-        else:
-            df = predictions
+        # Load data to get test_y (accepts a name, DataFrame, or Dataset)
+        df, dataset_name = _resolve_predictions(predictions, data_dir)
 
-        pred_matrix, model_names = extract_model_predictions(
-            df, predictions if isinstance(predictions, str) else None
-        )
+        pred_matrix, model_names = extract_model_predictions(df, dataset_name)
 
         # Resolve target model
         if isinstance(target_model, str):
