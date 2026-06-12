@@ -31,9 +31,9 @@ Quick start::
         "Is the sky blue?", True, DATASET_CONFIGS["strategyqa"]
     )
 
-    # Test case generation
-    gen = TopicAwareGenerator(topics=["arithmetic"], hard_examples=[...])
-    case = gen.generate(strategy="hss_gen")
+    # Test case generation — pass a Dataset (or DataFrame) plus a GP prior
+    gen = TopicAwareGenerator(df=df, dataset="gsm8k", prior_u=u, prior_S=S)
+    case = gen.generate(strategy="tss")
 """
 
 __version__ = "0.1.0"

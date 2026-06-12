@@ -309,9 +309,11 @@ for i in range(5):
 
 ## 3. Dataset — Bring Your Own Data
 
-`Dataset` bundles **questions + ground truths + a `DatasetConfig`** in a single
-object that the predictor (and, later, the sampler) operates on. Use it whenever
-you want to evaluate models on data that isn't already wired into
+`Dataset` is the single object that flows through the whole pipeline —
+**prediction → sampling → generation**. It bundles **questions + ground truths
++ a `DatasetConfig`**, and (when built from a predictions CSV) also exposes the
+prediction matrix and embeddings the sampler/generator need. Use it whenever you
+want to evaluate or sample on data that isn't already wired into
 `DATASET_CONFIGS`.
 
 ### Constructors
@@ -319,10 +321,14 @@ you want to evaluate models on data that isn't already wired into
 ```python
 from proeval import Dataset, DATASET_CONFIGS, LLMPredictor
 
-# (a) Built-in: load one of the 9 datasets shipped with ProEval
+# (a) Built-in: load one of the 10 built-in datasets from HuggingFace
 ds = Dataset.from_builtin("svamp")
 
-# (b) From in-memory lists (simplest custom case)
+# (b) From a pre-computed predictions CSV — offline, and the bridge to sampling.
+#     Carries questions/ground_truths AND the label_<model> matrix + embeddings.
+ds = Dataset.from_predictions("svamp")
+
+# (c) From in-memory lists (simplest custom case)
 ds = Dataset.from_lists(
     name="my_yesno",
     questions=["Is the sky blue?", "Is fire cold?"],
@@ -333,7 +339,7 @@ ds = Dataset.from_lists(
     compare_predictions=lambda p, g: 0.0 if str(p).lower() == g else 1.0,
 )
 
-# (c) From a CSV file
+# (d) From a CSV file
 ds = Dataset.from_csv(
     "my_data.csv",
     question_col="question",
@@ -343,7 +349,35 @@ ds = Dataset.from_csv(
 ```
 
 If you already have a built-in `DatasetConfig` that fits your scoring needs,
-pass it via `config=...` and skip the four eval-function arguments.
+pass it via `config=...` and skip the four eval-function arguments. A `config`
+is only required for `predict()`; a `Dataset` built purely for sampling can omit
+it.
+
+### Use a Dataset everywhere
+
+A `Dataset` can be passed directly to the sampler and generator in place of a
+dataset-name string — one object carries the data through every stage:
+
+```python
+from proeval import BQPriorSampler, TopicAwareGenerator
+
+ds = Dataset.from_predictions("svamp")
+
+# Sampling: equivalent to sample(predictions="svamp", ...), but the Dataset
+# also supplies its name (for GMM selection) and cached predictions.
+result = BQPriorSampler(noise_variance=0.3).sample(
+    predictions=ds, target_model="gemini25_flash", budget=50,
+)
+
+# The accessors the sampler relies on are also available directly:
+matrix, model_names = ds.prediction_matrix()   # (n_samples, n_models), 1=failure
+embeddings = ds.embeddings()                    # (n_samples, d)
+
+# Generation: pass the Dataset as `df`; its name drives the prompt format.
+gen = TopicAwareGenerator(df=ds, prior_u=prior_u, prior_S=prior_S)
+```
+
+Passing a name string or a raw DataFrame still works exactly as before.
 
 ### Predict
 
@@ -411,6 +445,7 @@ results = predictor.predict_batch_parallel(
 | GSM8K      | `"gsm8k"`      | Math problem solving    |
 | SVAMP      | `"svamp"`      | Math word problems      |
 | MMLU       | `"mmlu"`       | Multiple choice         |
+| MMLU (Law) | `"mmlu_professionallaw"` | Multiple choice |
 | Jigsaw     | `"jigsaw"`     | Toxicity classification |
 | ToxicChat  | `"toxicchat"`  | Toxicity classification |
 | GQA        | `"gqa"`        | Visual QA               |
@@ -626,5 +661,9 @@ python -m experiment.exp_performance_estimation \
 
 ## Available Data Files
 
-The `data/` directory contains pre-computed prediction CSVs and embeddings for:
-`gsm8k`, `svamp`, `strategyqa`, `mmlu`, `mmlu_professionallaw`, `jigsaw`, `toxicchat`, `gqa`, `dices`.
+The `data/` directory contains pre-computed prediction CSVs and embeddings for
+8 datasets:
+`gsm8k`, `svamp`, `strategyqa`, `mmlu`, `jigsaw`, `gqa`, `dices`, `dices_t2i`.
+
+(`mmlu_professionallaw` and `toxicchat` have `DATASET_CONFIGS` entries for
+prediction via `LLMPredictor`, but no pre-computed files ship in `data/`.)

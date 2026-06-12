@@ -225,3 +225,6 @@ data/checkpoints
 
 # Non-commercial Data
 data/toxicchat_*
+
+# Local configuration file
+CLAUDE.md

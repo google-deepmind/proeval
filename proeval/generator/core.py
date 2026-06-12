@@ -431,7 +431,9 @@ class TopicAwareGenerator:
        neutral prior (0.5).  No encoder or model predictions needed.
 
     Args:
-        df: Source DataFrame with ``question`` and ``ground_truth`` columns.
+        df: Source DataFrame with ``question`` and ``ground_truth`` columns,
+            or a :class:`~proeval.utils.Dataset` (its frame and ``name`` are
+            used; a non-default *dataset* still overrides the prompt format).
         dataset: ``"gsm8k"`` or ``"strategyqa"``.
         api_key: OpenRouter API key (or set ``OPENROUTER_API_KEY`` env var).
         model: Model to use for generation.
@@ -477,6 +479,16 @@ class TopicAwareGenerator:
         ss_threshold: float = 0.0,
         ss_beta: float = 1.96,
     ):
+        # Accept a Dataset in place of a DataFrame: derive the question frame
+        # and the dataset name from it. An explicit, non-default `dataset`
+        # still wins (it controls the prompt format).
+        from proeval.utils.dataset import Dataset
+
+        if isinstance(df, Dataset):
+            if dataset == "gsm8k":
+                dataset = df.name
+            df = df.to_frame()
+
         self.df = df
         self.dataset = dataset
         self.client = OpenRouterClient(api_key=api_key)
