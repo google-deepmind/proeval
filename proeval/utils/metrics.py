@@ -75,7 +75,12 @@ def topic_entropy(topics: List[str], normalize: bool = True) -> float:
     counts = Counter(topics)
     n = len(topics)
     probs = np.array([c / n for c in counts.values()])
-    entropy = float(-np.sum(probs * np.log2(probs + 1e-12)))
+    
+    # The 1e-12 smoothing term avoids log2(0) but makes a single-class
+    # distribution (true entropy == 0) compute as a tiny negative number
+    # (e.g. -1.44e-12). Clamp to 0 so entropy is never negative.
+    entropy = max(0.0, float(-np.sum(probs * np.log2(probs + 1e-12))))
+    
     if normalize:
         max_ent = np.log2(len(counts)) if len(counts) > 1 else 1.0
         return (entropy / max_ent) * 100.0 if max_ent > 0 else 0.0
