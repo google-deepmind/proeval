@@ -176,3 +176,26 @@ def test_active_estimates_are_post_sample_posteriors():
     assert result.estimates[0] == pytest.approx(np.mean(first_posterior))
     assert result.estimates[-1] == pytest.approx(np.mean(final_posterior))
     np.testing.assert_allclose(result.posterior_mean, final_posterior)
+
+
+@pytest.mark.parametrize("kind", ["sf", "rpf", "tpf"])
+def test_active_sampling_rejects_n_init_above_budget(kind):
+    with pytest.raises(ValueError, match="0 <= n_init <= budget <= n_samples"):
+        _run_active(kind, budget=2, n_init=3)
+
+
+@pytest.mark.parametrize("kind", ["sf", "rpf", "tpf"])
+def test_active_sampling_rejects_budget_above_n_samples(kind):
+    n_samples = len(_synthetic_case()[1])
+    with pytest.raises(ValueError, match="0 <= n_init <= budget <= n_samples"):
+        _run_active(kind, budget=n_samples + 1)
+
+
+@pytest.mark.parametrize("kind", ["sf", "rpf", "tpf"])
+@pytest.mark.parametrize(("budget", "n_init"), [(0, 0), (12, 12)])
+def test_active_sampling_accepts_budget_boundaries(kind, budget, n_init):
+    result = _run_active(kind, budget=budget, n_init=n_init)
+
+    assert len(result.selected_indices) == budget
+    assert len(set(result.selected_indices)) == budget
+    assert len(result.estimates) == budget

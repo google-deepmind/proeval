@@ -228,6 +228,18 @@ def _variance_improvement_gp(
 
 
 # Core BQ sampling loop
+
+
+def _validate_active_sampling_budget(
+    n_init: int, budget: int, n_samples: int
+) -> None:
+    """Validate active-sampling budget bounds before sampling."""
+    if not 0 <= n_init <= budget <= n_samples:
+        raise ValueError(
+            "expected 0 <= n_init <= budget <= n_samples; "
+            f"got n_init={n_init}, budget={budget}, n_samples={n_samples}"
+        )
+
 def _bq_active_sampling(
     test_x: np.ndarray,
     test_y: np.ndarray,
@@ -243,6 +255,7 @@ def _bq_active_sampling(
     step, the acquisition-order indices, and the final posterior.
     """
     n_samples = test_x.shape[1]
+    _validate_active_sampling_budget(n_init, budget, n_samples)
 
     # Optional random initialisation from "interesting" prior range
     good_indices = [i for i in range(len(u)) if 0.2 < u[i] < 0.6]
@@ -533,6 +546,7 @@ def _bq_matern_active_sampling(
     # Normalize embeddings
     emb_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-10)
     n_samples = emb_norm.shape[0]
+    _validate_active_sampling_budget(n_init, budget, n_samples)
 
     # Optional random initialisation
     good_indices = [i for i in range(n_samples) if 0.2 < u[i] < 0.6]
@@ -838,6 +852,7 @@ def _bq_encoder_sampling(
 
     kernel_type = getattr(encoder, "kernel_type", "linear")
     n_samples = phi_embeddings.shape[0]
+    _validate_active_sampling_budget(n_init, budget, n_samples)
 
     # Optional random initialisation from "interesting" prior range
     good_indices = [i for i in range(n_samples) if 0.2 < u[i] < 0.6]
