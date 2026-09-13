@@ -233,7 +233,8 @@ def variance_improvement(train_x, k_t_inv, noise_variance, unlabeled_indices, te
     A = test_x.T
     K = k_t_inv
     Q = test_x[:, unlabeled_indices].T
-    e = noise_variance
+    # Match the noise precision used by get_posterior.
+    e = 1 / noise_variance
     best_local_idx, k_t_inv = find_best_i_and_update(A, K, Q, e)
     return unlabeled_indices[best_local_idx], k_t_inv
 
