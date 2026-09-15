@@ -46,8 +46,10 @@ Example — fix errors in existing CSV::
 """
 
 import csv
+import hashlib
 import json
 import os
+from numbers import Integral, Real
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -95,28 +97,49 @@ class UnifiedCSVManager:
         self.dataset_name = dataset_name
         self.output_dir = output_dir
         self.csv_path = os.path.join(output_dir, f"{dataset_name}_predictions.csv")
+        self.metadata_path = os.path.join(
+            output_dir, f".{dataset_name}_dataset_metadata.json"
+        )
         self.df: Optional[pd.DataFrame] = None
+        self.dataset_fingerprint: Optional[str] = None
 
     # ── load / create ─────────────────────────────────────────────────
 
     def load_or_create(
-        self, questions: List[str], ground_truths: List[Any]
+        self, questions: List[Any], ground_truths: List[Any]
     ) -> pd.DataFrame:
         """Load existing CSV or create a new DataFrame.
 
         Returns the DataFrame (also stored as ``self.df``).
         """
         if os.path.exists(self.csv_path):
-            self.df = pd.read_csv(self.csv_path)
+            self.df = pd.read_csv(
+                self.csv_path,
+                converters={"question": str, "ground_truth": str},
+            )
+            self._validate_dataset_alignment(questions, ground_truths)
+            self._validate_dataset_metadata()
+            # The converter read preserves exact CSV identity for validation,
+            # but callers should see the same value types they supplied when
+            # creating the manager, not CSV strings such as ``"False"``.
+            self.df["question"] = pd.Series(
+                questions, index=self.df.index, dtype=object
+            )
+            self.df["ground_truth"] = pd.Series(
+                ground_truths, index=self.df.index, dtype=object
+            )
             print(f"Loaded existing CSV: {self.csv_path} ({len(self.df)} rows)")
-            if len(self.df) != len(questions):
-                raise ValueError(
-                    f"Row count mismatch: CSV has {len(self.df)}, "
-                    f"but {len(questions)} questions provided"
-                )
         else:
-            self.df = pd.DataFrame(
-                {"index": range(len(questions)), "question": questions, "ground_truth": ground_truths}
+            if len(questions) != len(ground_truths):
+                raise ValueError(
+                    f"Length mismatch: {len(questions)} questions vs "
+                    f"{len(ground_truths)} ground truths"
+                )
+            self.df = pd.DataFrame({"index": range(len(questions))})
+            self.df["question"] = pd.Series(questions, dtype=object)
+            self.df["ground_truth"] = pd.Series(ground_truths, dtype=object)
+            self.dataset_fingerprint = self._fingerprint_dataset(
+                questions, ground_truths
             )
             print(f"Created new CSV structure: {self.csv_path}")
         return self.df
@@ -194,7 +217,20 @@ class UnifiedCSVManager:
         """Save DataFrame to CSV."""
         self._check_init()
         os.makedirs(self.output_dir, exist_ok=True)
+        if self.dataset_fingerprint is None:
+            self.dataset_fingerprint = self._fingerprint_dataset(
+                self.df["question"].tolist(),
+                self.df["ground_truth"].tolist(),
+            )
         self.df.to_csv(self.csv_path, index=False)
+        metadata = {
+            "version": 1,
+            "dataset_name": self.dataset_name,
+            "rows": len(self.df),
+            "fingerprint": self.dataset_fingerprint,
+        }
+        with open(self.metadata_path, "w", encoding="utf-8") as file:
+            json.dump(metadata, file, sort_keys=True)
         print(f"Saved predictions to: {self.csv_path}")
 
     # ── high-level run & fix ──────────────────────────────────────────
@@ -204,7 +240,7 @@ class UnifiedCSVManager:
         predictor,
         model_name: str,
         dataset_config,
-        questions: List[str],
+        questions: List[Any],
         ground_truths: List[Any],
         parallel: bool = True,
         workers: int = 10,
@@ -233,35 +269,48 @@ class UnifiedCSVManager:
             checkpoint_interval: Save checkpoint every N items (sequential).
         """
         self._check_init()
+        self._validate_dataset_alignment(questions, ground_truths)
 
         # Skip if already done
         if self.has_model(model_name) and not rerun:
             acc = self.get_model_accuracy(model_name)
             errs = len(self.get_error_indices(model_name))
-            print(f"Model '{model_name}' already evaluated (acc={acc:.2%}, {errs} errors).")
+            accuracy = f"{acc:.2%}" if acc is not None else "N/A"
+            print(f"Model '{model_name}' already evaluated (acc={accuracy}, {errs} errors).")
             print("Use rerun=True to force, or fix_errors() to fix failures.")
             return
 
         ckpt_path = os.path.join(
             self.output_dir, f".checkpoint_{self.dataset_name}_{model_name}.json"
         )
+        predictor_model = getattr(predictor, "model", None)
+        config_fingerprint = self._dataset_config_fingerprint(dataset_config)
         start_idx = 0
         completed: List[Tuple] = []
 
         # Resume from checkpoint
         if os.path.exists(ckpt_path) and not rerun:
             try:
-                with open(ckpt_path) as f:
+                with open(ckpt_path, encoding="utf-8") as f:
                     ckpt = json.load(f)
-                start_idx = ckpt.get("last_completed_idx", 0) + 1
-                completed = [tuple(r) for r in ckpt.get("results", [])]
-                print(f"Resuming from checkpoint: {start_idx}/{len(questions)}")
-            except Exception as e:
+            except (OSError, json.JSONDecodeError) as e:
                 print(f"Warning: could not load checkpoint ({e}), starting fresh")
-                start_idx, completed = 0, []
+            else:
+                start_idx, completed = self._validate_checkpoint(
+                    ckpt,
+                    model_name=model_name,
+                    questions=questions,
+                    ground_truths=ground_truths,
+                    predictor_model=predictor_model,
+                    config_fingerprint=config_fingerprint,
+                    skip_error=skip_error,
+                )
+                print(f"Resuming from checkpoint: {start_idx}/{len(questions)}")
 
         all_results = list(completed)
-        skipped = 0
+        skipped = sum(
+            1 for result in completed if result[3] in self.ERROR_SENTINELS
+        )
 
         try:
             if parallel:
@@ -292,15 +341,39 @@ class UnifiedCSVManager:
 
                     # Save checkpoint periodically
                     if (idx + 1) % checkpoint_interval == 0:
-                        self._save_checkpoint(ckpt_path, idx, all_results, model_name)
+                        self._save_checkpoint(
+                            ckpt_path,
+                            idx,
+                            all_results,
+                            model_name,
+                            predictor_model=predictor_model,
+                            config_fingerprint=config_fingerprint,
+                            skip_error=skip_error,
+                        )
 
                 # Final checkpoint
-                self._save_checkpoint(ckpt_path, len(questions) - 1, all_results, model_name)
+                self._save_checkpoint(
+                    ckpt_path,
+                    len(questions) - 1,
+                    all_results,
+                    model_name,
+                    predictor_model=predictor_model,
+                    config_fingerprint=config_fingerprint,
+                    skip_error=skip_error,
+                )
 
         except Exception:
             if all_results:
                 last = start_idx + len(all_results) - 1 - len(completed)
-                self._save_checkpoint(ckpt_path, last, all_results, model_name)
+                self._save_checkpoint(
+                    ckpt_path,
+                    last,
+                    all_results,
+                    model_name,
+                    predictor_model=predictor_model,
+                    config_fingerprint=config_fingerprint,
+                    skip_error=skip_error,
+                )
                 print(f"Error! Progress saved ({len(all_results)} items). Re-run to resume.")
             raise
 
@@ -317,15 +390,19 @@ class UnifiedCSVManager:
 
         # Report
         valid = [l for l in labels if not (isinstance(l, float) and np.isnan(l))]
-        acc = 1 - (sum(valid) / len(valid)) if valid else 0
-        print(f"\nModel: {model_name} | Evaluated: {len(valid)} | Skipped: {skipped} | Accuracy: {acc:.2%}")
+        acc = 1 - (sum(valid) / len(valid)) if valid else None
+        accuracy = f"{acc:.2%}" if acc is not None else "N/A"
+        print(
+            f"\nModel: {model_name} | Evaluated: {len(valid)} | "
+            f"Skipped: {skipped} | Accuracy: {accuracy}"
+        )
 
     def fix_errors(
         self,
         predictor,
         model_name: str,
         dataset_config,
-        questions: List[str],
+        questions: List[Any],
         ground_truths: List[Any],
         parallel: bool = True,
         workers: int = 10,
@@ -342,6 +419,7 @@ class UnifiedCSVManager:
             ground_truths: Full ground-truth list.
         """
         self._check_init()
+        self._validate_dataset_alignment(questions, ground_truths)
         if not self.has_model(model_name):
             print(f"Model '{model_name}' not found in CSV. Run evaluation first.")
             return
@@ -349,7 +427,8 @@ class UnifiedCSVManager:
         error_idx = self.get_error_indices(model_name)
         if not error_idx:
             acc = self.get_model_accuracy(model_name)
-            print(f"No errors for '{model_name}'. Accuracy: {acc:.2%}")
+            accuracy = f"{acc:.2%}" if acc is not None else "N/A"
+            print(f"No errors for '{model_name}'. Accuracy: {accuracy}")
             return
 
         print(f"Fixing {len(error_idx)} errors for '{model_name}'...")
@@ -394,12 +473,274 @@ class UnifiedCSVManager:
         if self.df is None:
             raise ValueError("DataFrame not initialised. Call load_or_create() first.")
 
-    def _save_checkpoint(self, path, last_idx, results, model_name):
+    def _validate_dataset_alignment(
+        self, questions: List[Any], ground_truths: List[Any]
+    ) -> None:
+        """Ensure caller inputs exactly match the stored dataset and row order."""
+        self._check_init()
+        if len(questions) != len(ground_truths):
+            raise ValueError(
+                f"Length mismatch: {len(questions)} questions vs "
+                f"{len(ground_truths)} ground truths"
+            )
+        if len(self.df) != len(questions):
+            raise ValueError(
+                f"Row count mismatch: CSV has {len(self.df)}, "
+                f"but {len(questions)} questions provided"
+            )
+
+        required_columns = ("question", "ground_truth")
+        missing_columns = [
+            column for column in required_columns if column not in self.df.columns
+        ]
+        if missing_columns:
+            raise ValueError(
+                "Existing CSV is missing required dataset columns: "
+                + ", ".join(missing_columns)
+            )
+
+        supplied_fingerprint = self._fingerprint_dataset(questions, ground_truths)
+        if (
+            self.dataset_fingerprint is not None
+            and supplied_fingerprint != self.dataset_fingerprint
+        ):
+            raise ValueError(
+                "Dataset fingerprint mismatch. Use the same questions, ground "
+                "truths, value types, and row order as the loaded CSV."
+            )
+
+        for column in required_columns:
+            stored_values = [
+                self._csv_text(value) for value in self.df[column].tolist()
+            ]
+            supplied_source = questions if column == "question" else ground_truths
+            supplied_values = [self._csv_text(value) for value in supplied_source]
+            for row, (stored, supplied) in enumerate(
+                zip(stored_values, supplied_values)
+            ):
+                if stored == supplied:
+                    continue
+                raise ValueError(
+                    f"Dataset mismatch at row {row} for {column!r}: "
+                    f"CSV has {stored!r}, but the caller provided "
+                    f"{supplied!r}. Use the same "
+                    "questions, ground truths, and row order as the CSV."
+                )
+        self.dataset_fingerprint = supplied_fingerprint
+
+    @staticmethod
+    def _is_missing_scalar(value: Any) -> bool:
+        if value is None:
+            return True
+        try:
+            missing = pd.isna(value)
+        except (TypeError, ValueError):
+            return False
+        return isinstance(missing, (bool, np.bool_)) and bool(missing)
+
+    @classmethod
+    def _csv_text(cls, value: Any) -> str:
+        """Return the exact scalar text persisted by ``DataFrame.to_csv``."""
+        if cls._is_missing_scalar(value):
+            return ""
+        return str(value)
+
+    @classmethod
+    def _fingerprint_dataset(
+        cls, questions: List[Any], ground_truths: List[Any]
+    ) -> str:
+        """Build a typed, order-sensitive fingerprint for dataset identity."""
+        rows = []
+        for question, ground_truth in zip(questions, ground_truths):
+            row = []
+            for value in (question, ground_truth):
+                if cls._is_missing_scalar(value):
+                    row.append({"type": "missing"})
+                    continue
+                converted = convert_numpy_types(value)
+                value_type = type(converted)
+                row.append(
+                    {
+                        "type": f"{value_type.__module__}.{value_type.__qualname__}",
+                        "repr": repr(converted),
+                    }
+                )
+            rows.append(row)
+        payload = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _validate_dataset_metadata(self) -> None:
+        """Validate the persisted dataset identity sidecar when present."""
+        if not os.path.exists(self.metadata_path):
+            return
+        try:
+            with open(self.metadata_path, encoding="utf-8") as file:
+                metadata = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Could not read dataset metadata: {self.metadata_path}"
+            ) from exc
+
+        expected = {
+            "dataset_name": self.dataset_name,
+            "rows": len(self.df),
+            "fingerprint": self.dataset_fingerprint,
+        }
+        mismatches = [
+            key for key, value in expected.items() if metadata.get(key) != value
+        ]
+        if mismatches:
+            raise ValueError(
+                "Dataset metadata does not match the loaded CSV/caller inputs "
+                f"({', '.join(mismatches)}). Use the original dataset and row order."
+            )
+
+    def _validate_checkpoint(
+        self,
+        checkpoint: Any,
+        *,
+        model_name: str,
+        questions: List[Any],
+        ground_truths: List[Any],
+        predictor_model: Any,
+        config_fingerprint: str,
+        skip_error: bool,
+    ) -> Tuple[int, List[Tuple]]:
+        """Validate checkpoint identity and completed-row alignment."""
+
+        def invalid(reason: str) -> ValueError:
+            return ValueError(
+                f"Checkpoint does not match the current evaluation ({reason}). "
+                "Use the original dataset/model, delete the checkpoint, or "
+                "pass rerun=True."
+            )
+
+        if not isinstance(checkpoint, dict):
+            raise invalid("payload")
+        if checkpoint.get("task") != self.dataset_name:
+            raise invalid("dataset name")
+        if checkpoint.get("model_name") != model_name:
+            raise invalid("model name")
+        if (
+            "predictor_model" in checkpoint
+            and checkpoint["predictor_model"] != predictor_model
+        ):
+            raise invalid("predictor model")
+        if (
+            "config_fingerprint" in checkpoint
+            and checkpoint["config_fingerprint"] != config_fingerprint
+        ):
+            raise invalid("dataset configuration")
+
+        last_completed = checkpoint.get("last_completed_idx")
+        if (
+            isinstance(last_completed, bool)
+            or not isinstance(last_completed, Integral)
+            or last_completed < -1
+            or last_completed >= len(questions)
+        ):
+            raise invalid("last completed index")
+
+        raw_results = checkpoint.get("results")
+        if not isinstance(raw_results, list):
+            raise invalid("results payload")
+        if any(not isinstance(result, (list, tuple)) for result in raw_results):
+            raise invalid("results payload")
+        completed = [tuple(result) for result in raw_results]
+        if len(completed) != last_completed + 1:
+            raise invalid("result count")
+        for row, result in enumerate(completed):
+            if len(result) != 5:
+                raise invalid(f"result row {row}")
+            if isinstance(result[4], bool) or not isinstance(result[4], Real):
+                raise invalid(f"result score at row {row}")
+            try:
+                score = float(result[4])
+            except (OverflowError, TypeError, ValueError):
+                raise invalid(f"result score at row {row}") from None
+            if np.isinf(score):
+                raise invalid(f"result score at row {row}")
+
+        if "skip_error" in checkpoint:
+            if checkpoint["skip_error"] != skip_error:
+                raise invalid("skip-error policy")
+        else:
+            # Legacy checkpoints did not store the policy. Sentinel rows make
+            # it observable: skipped failures have NaN scores, while failures
+            # counted as errors have numeric scores.
+            for result in completed:
+                if result[3] not in self.ERROR_SENTINELS:
+                    continue
+                stored_skip_error = bool(np.isnan(float(result[4])))
+                if stored_skip_error != skip_error:
+                    raise invalid("skip-error policy")
+
+        checkpoint_fingerprint = checkpoint.get("dataset_fingerprint")
+        if checkpoint_fingerprint is not None:
+            if checkpoint_fingerprint != self.dataset_fingerprint:
+                raise invalid("dataset fingerprint")
+        else:
+            # Legacy checkpoints predate fingerprints. Compare the JSON form
+            # they actually persisted so tuples and non-string mapping keys do
+            # not become false mismatches after a JSON round trip.
+            for row, result in enumerate(completed):
+                expected_question = self._checkpoint_json(questions[row])
+                expected_truth = self._checkpoint_json(ground_truths[row])
+                if (
+                    self._checkpoint_json(result[0]) != expected_question
+                    or self._checkpoint_json(result[1]) != expected_truth
+                ):
+                    raise invalid(f"result prefix at row {row}")
+
+        return last_completed + 1, completed
+
+    @staticmethod
+    def _checkpoint_json(value: Any) -> str:
+        """Return the JSON representation used in checkpoint persistence."""
+        return json.dumps(
+            convert_numpy_types(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _dataset_config_fingerprint(dataset_config: Any) -> str:
+        """Fingerprint stable, serializable parts of an evaluator config."""
+        identity = {
+            "name": getattr(dataset_config, "name", None),
+            "json_schema": convert_numpy_types(
+                getattr(dataset_config, "json_schema", None)
+            ),
+        }
+        payload = json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _save_checkpoint(
+        self,
+        path,
+        last_idx,
+        results,
+        model_name,
+        *,
+        predictor_model,
+        config_fingerprint,
+        skip_error,
+    ):
         data = convert_numpy_types({
             "last_completed_idx": last_idx,
             "results": results,
             "model_name": model_name,
             "task": self.dataset_name,
+            "dataset_fingerprint": self.dataset_fingerprint,
+            "predictor_model": predictor_model,
+            "config_fingerprint": config_fingerprint,
+            "skip_error": skip_error,
         })
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w") as f:

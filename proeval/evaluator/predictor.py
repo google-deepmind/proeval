@@ -235,7 +235,7 @@ def create_svamp_config() -> DatasetConfig:
             {"reasoning": {"type": "string"}, "answer": {"type": "string"}},
             ["reasoning", "answer"],
         ),
-        extract_prediction=lambda d: d["answer"].replace(",", "").strip(),
+        extract_prediction=lambda d: str(d["answer"]).replace(",", "").strip(),
         extract_ground_truth=_gt,
         compare_predictions=_cmp,
     )
