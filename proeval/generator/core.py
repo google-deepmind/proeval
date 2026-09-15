@@ -179,9 +179,11 @@ def select_hard_problems_bq(
     threshold: float = 0.7,
     noise_variance: float = 0.3,
 ) -> Tuple[List[int], np.ndarray, np.ndarray]:
-    """Select hard problems via HSS active sampling.
+    """Select hard problems via SS active sampling on failure scores.
 
-    Returns ``(hard_indices, posterior_mean, posterior_var)``.
+    ``threshold`` is the failure-score boundary used for acquisition and
+    filtering the final posterior means. Returns
+    ``(hard_indices, posterior_mean, posterior_var)``.
     """
     from proeval.sampler.bq import _get_posterior
 
@@ -193,7 +195,7 @@ def select_hard_problems_bq(
     for _ in range(min(budget, n_samples)):
         if not unlabeled:
             break
-        best = ss_acquisition(u_t, s_t, unlabeled, threshold=0.5, beta=1.96)
+        best = ss_acquisition(u_t, s_t, unlabeled, threshold=threshold, beta=1.96)
         labeled.append(best)
         unlabeled.remove(best)
         if labeled:
@@ -201,9 +203,9 @@ def select_hard_problems_bq(
                 test_x[:, labeled], test_y[labeled], test_x, noise_variance, labeled, u
             )
 
-    hard = [i for i in labeled if u[i] < threshold]
+    hard = [i for i in labeled if u_t[i] >= threshold]
     if len(hard) < budget // 2:
-        hard = sorted(labeled, key=lambda x: u[x])[:budget]
+        hard = sorted(labeled, key=lambda x: u_t[x], reverse=True)[:budget]
     return hard, u_t, s_t
 
 
@@ -343,9 +345,9 @@ def get_posterior_embedding(
         phi_t = torch.from_numpy(phi_test).float().to(device)
         K = compute_kernel_matrix(phi_t, encoder)
         if full_cov:
-            return u.copy(), K.cpu().numpy()
+            return u.copy(), K.detach().cpu().numpy()
         else:
-            return u.copy(), torch.diag(K).cpu().numpy()
+            return u.copy(), torch.diag(K).detach().cpu().numpy()
 
     phi_train_t = torch.from_numpy(phi_train).float().to(device)
     phi_test_t = torch.from_numpy(phi_test).float().to(device)
@@ -415,9 +417,11 @@ def get_posterior_embedding(
 class TopicAwareGenerator:
     """Topic-aware test case generator with internal GP state management.
 
-    Manages its own GP posterior and dynamically selects hard anchors via
-    SS acquisition each ``generate()`` call. Call ``update(score)`` after
-    evaluating each generated case to update the GP posterior.
+    Selects hard anchors via SS acquisition each ``generate()`` call.
+    Call ``update(score)`` after evaluating each generated case to update
+    topic rewards and score history. Generated-input GP conditioning is
+    not supported by this score-only API: it would also require embeddings
+    or kernel covariances for the generated inputs.
 
     Topic modeling (BERTopic) is handled internally — just pass ``n_topics``.
 
@@ -513,6 +517,7 @@ class TopicAwareGenerator:
         self.labeled_indices: List[int] = []
         self.labeled_y: List[float] = []
         self._last_anchors: List[int] = []
+        self._last_topic: Optional[str] = None
         self._iteration = 0
 
         # Encoder state (with pretrain only)
@@ -608,6 +613,10 @@ class TopicAwareGenerator:
         where r̄(s) is the failure rate for topic s, N is total trials,
         and n(s) is trials for topic s.
         """
+        for item in items:
+            if stats[item]["total"] == 0:
+                return item
+
         N = max(1, sum(s["total"] for s in stats.values()))
         scores = []
         for item in items:
@@ -661,16 +670,22 @@ class TopicAwareGenerator:
     # GP Posterior Update
 
     def update(self, score: float) -> None:
-        """Feed back an evaluation result to update the GP posterior.
+        """Record the latest generated case's score and topic reward.
+
+        Generated inputs do not belong to the source pool, so their scores
+        alone cannot condition its GP. This method does not add generated
+        observations to the GP without their embeddings or covariances.
 
         Args:
             score: Error score — ``1.0`` for failure, ``0.0`` for correct.
+                Scores at or above ``0.5`` count as failures, matching
+                :attr:`failures_found`.
         """
         self.labeled_y.append(score)
 
-        # Update topic stats for last generation
-        # (topic_stats already updated in generate(), but labeled_y is needed
-        #  for posterior update)
+        if self._last_topic is not None:
+            self.update_stats(self._last_topic, score)
+            self._last_topic = None
 
         if self.prior_mode == "encoder":
             # With pretrain: encoder-based posterior (TPF)
@@ -746,16 +761,10 @@ class TopicAwareGenerator:
         # Topic selection
         if strategy in ("pure_random", "ss_gen"):
             topic = None
-            topic_id = None
         elif strategy in ("random_topic", "random"):
             topic = random.choice(self.topics)
-            topic_id = self.topics.index(topic) if topic in self.topics else None
-            if topic_id is not None and topic_id < len(self.unique_topics):
-                topic_id = self.unique_topics[topic_id % len(self.unique_topics)]
         elif strategy == "tss":
             topic = self._select_topic_ucb1(self.topics, self.topic_stats)
-            topic_idx = self.topics.index(topic) if topic in self.topics else 0
-            topic_id = self.unique_topics[topic_idx % len(self.unique_topics)]
         else:
             raise ValueError(
                 f"Unknown strategy: {strategy!r}. "
@@ -764,9 +773,10 @@ class TopicAwareGenerator:
 
         # Hard anchor selection
         if strategy in ("tss", "ss_gen") and k_examples > 0:
-            use_topic = strategy == "tss"
+            # TSS transfers failure patterns from any topic into the chosen
+            # topic; anchor selection is independent of topic selection.
             selected_hard = self._select_hard_anchors(
-                k_examples, topic_id=topic_id, use_topic=use_topic,
+                k_examples, use_topic=False,
             )
         else:
             selected_hard = []
@@ -810,14 +820,19 @@ class TopicAwareGenerator:
         # Update topic stats
         if topic and topic in self.topic_stats:
             self.topic_stats[topic]["total"] += 1
+        self._last_topic = topic
 
         return result
 
     def update_stats(self, topic: str, score: float) -> None:
         """Record a failure for a topic (called after evaluation).
 
-        .. deprecated:: Use :meth:`update` instead, which handles both
-           topic stats and GP posterior.
+        ``score`` follows the error convention: ``1.0`` for failure and
+        ``0.0`` for correct. Values at or above ``0.5`` count as failures,
+        matching :attr:`failures_found`.
+
+        .. deprecated:: Use :meth:`update` instead to also record score
+           history for the latest generated case.
         """
-        if topic in self.topic_stats and score == 0.0:
+        if topic in self.topic_stats and score >= 0.5:
             self.topic_stats[topic]["failures"] += 1
