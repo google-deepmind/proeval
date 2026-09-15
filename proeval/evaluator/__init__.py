@@ -24,6 +24,7 @@ from proeval.evaluator.client import (
     MODEL_MAPPING,
     OpenRouterClient,
     PredictionClient,
+    PredictionClientError,
     resolve_model_name,
 )
 from proeval.evaluator.csv_manager import (
@@ -51,6 +52,7 @@ from proeval.evaluator.predictor import (
 __all__ = [
     "OpenRouterClient",
     "PredictionClient",
+    "PredictionClientError",
     "MODEL_MAPPING",
     "resolve_model_name",
     "LLMPredictor",

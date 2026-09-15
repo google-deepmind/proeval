@@ -25,11 +25,16 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
-from proeval.evaluator.client import OpenRouterClient, PredictionClient
+from proeval.evaluator.client import (
+    OpenRouterClient,
+    PredictionClient,
+    PredictionClientError,
+)
 
 # Prompt templates
 
@@ -441,40 +446,54 @@ class LLMPredictor:
         after all retries, *prediction* and *error_score* are ``None`` while
         the last raw response is preserved for debugging. Batch methods turn
         this state into a ``"PARSE_ERROR"`` result with the requested score.
-        """
-        prompt = dataset_config.prompt_template(question)
-        last_response = None
 
-        if max_parse_retries < 1:
-            raise ValueError("max_parse_retries must be at least 1")
+        Raises:
+            PredictionClientError: If the inference client fails or does not
+                return a string. Custom clients own any transient retries.
+            ValueError: If *max_parse_retries* is not a positive integer.
+        """
+        self._validate_parse_retries(max_parse_retries)
+        prompt = dataset_config.prompt_template(question)
+        last_response: Optional[str] = None
 
         for attempt in range(max_parse_retries):
             # Inference failures are not parse failures. Let single-item
             # callers handle them directly; batch methods convert them into a
             # per-item error result so the rest of the batch can continue.
-            response = self.client.predict(
-                prompt,
-                model=self.model,
-                response_format=dataset_config.json_schema,
-                max_tokens=8192,
-            )
-            last_response = response
             try:
-                if not response or not response.strip():
-                    if attempt < max_parse_retries - 1:
-                        time.sleep(1.0 * (2 ** attempt))
-                    continue
+                response = self.client.predict(
+                    prompt,
+                    model=self.model,
+                    response_format=dataset_config.json_schema,
+                    max_tokens=8192,
+                )
+            except Exception as error:
+                raise PredictionClientError(str(error)) from error
+            if not isinstance(response, str):
+                raise PredictionClientError(
+                    "prediction client must return a string; "
+                    f"got {type(response).__name__}"
+                )
+            last_response = response
 
-                cleaned = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
-                cleaned = re.sub(r"```(?:json)?\s*\n?", "", cleaned).strip()
-                cleaned = cleaned.lstrip("\ufeff\u200b\u200c\u200d\u2060\u00a0")
-                m = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", cleaned)
-                if m:
-                    cleaned = m.group(0)
-                cleaned = re.sub(r"(\{|,)\s*([a-zA-Z_]\w*)\s*:", r'\1"\2":', cleaned)
+            if not response.strip():
+                if attempt < max_parse_retries - 1:
+                    time.sleep(1.0 * (2 ** attempt))
+                continue
 
+            cleaned = re.sub(
+                r"<think>.*?</think>", "", response, flags=re.DOTALL
+            ).strip()
+            cleaned = re.sub(r"```(?:json)?\s*\n?", "", cleaned).strip()
+            cleaned = cleaned.lstrip("\ufeff\u200b\u200c\u200d\u2060\u00a0")
+            match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", cleaned)
+            if match:
+                cleaned = match.group(0)
+            cleaned = re.sub(r"(\{|,)\s*([a-zA-Z_]\w*)\s*:", r'\1"\2":', cleaned)
+
+            prediction = None
+            try:
                 # Try parsing without quote mangling first (preserves apostrophes)
-                data = None
                 try:
                     data = json.loads(cleaned)
                 except json.JSONDecodeError:
@@ -482,36 +501,32 @@ class LLMPredictor:
                     # Only replace quotes at JSON structural positions, not apostrophes
                     alt = re.sub(r"(?<=[\{,:])\s*'|'\s*(?=[:,\}])", '"', cleaned)
                     data = json.loads(alt)
-
                 prediction = dataset_config.extract_prediction(data)
-
-                if prediction and len(str(prediction)) > 50:
-                    if attempt < max_parse_retries - 1:
-                        time.sleep(1.0 * (2 ** attempt))
-                    continue
-
-                gt_cleaned = dataset_config.extract_ground_truth(ground_truth)
-                score = dataset_config.compare_predictions(prediction, gt_cleaned)
-                return response, prediction, score
-
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 # Regex fallback
-                for txt in [cleaned, response]:
+                for text in (cleaned, response):
                     for field in ("answer", "is_toxic", "rating"):
                         pat = rf'"{field}"\s*:\s*"?([^",}}\n]+)"?'
-                        fm = re.search(pat, txt)
-                        if fm:
-                            fb = fm.group(1).strip().strip('"')
-                            if fb.lower() in ("null", "none", ""):
+                        fallback_match = re.search(pat, text)
+                        if fallback_match:
+                            fallback = fallback_match.group(1).strip().strip('"')
+                            if fallback.lower() in ("null", "none", ""):
                                 continue
-                            gt_cleaned = dataset_config.extract_ground_truth(ground_truth)
-                            score = dataset_config.compare_predictions(fb, gt_cleaned)
-                            return response, fb, score
+                            prediction = fallback
+                            break
+                    if prediction is not None:
+                        break
+
+            if prediction is None or (prediction and len(str(prediction)) > 50):
                 if attempt < max_parse_retries - 1:
                     time.sleep(1.0 * (2 ** attempt))
-            except (TypeError, ValueError):
-                if attempt < max_parse_retries - 1:
-                    time.sleep(1.0 * (2 ** attempt))
+                continue
+
+            ground_truth_cleaned = dataset_config.extract_ground_truth(ground_truth)
+            score = dataset_config.compare_predictions(
+                prediction, ground_truth_cleaned
+            )
+            return response, prediction, score
 
         return last_response, None, None
 
@@ -533,6 +548,7 @@ class LLMPredictor:
         or as NaN when *skip_error* is true.
         """
         self._validate_batch_lengths(questions, ground_truths)
+        self._validate_parse_retries(max_parse_retries)
         results = []
         it = (
             tqdm(zip(questions, ground_truths), total=len(questions), desc=f"Evaluating {dataset_config.name}")
@@ -584,8 +600,21 @@ class LLMPredictor:
         show_progress: bool = True,
         skip_error: bool = False,
     ) -> List[Tuple[str, Any, str, Any, float]]:
-        """Parallel batch evaluation using ThreadPoolExecutor (5–10× faster)."""
+        """Parallel batch evaluation using ThreadPoolExecutor (5–10× faster).
+
+        Custom inference clients are shared across workers and must therefore
+        be thread-safe. Use sequential batching otherwise.
+        """
         self._validate_batch_lengths(questions, ground_truths)
+        self._validate_parse_retries(max_parse_retries)
+        if (
+            isinstance(max_workers, bool)
+            or not isinstance(max_workers, Integral)
+            or max_workers < 1
+        ):
+            raise ValueError(
+                f"max_workers must be a positive integer; got {max_workers!r}"
+            )
         results: List[Optional[Tuple]] = [None] * len(questions)
         lock = threading.Lock()
         skipped = [0]
@@ -633,7 +662,7 @@ class LLMPredictor:
                 dataset_config,
                 max_parse_retries=max_parse_retries,
             )
-        except Exception as error:
+        except PredictionClientError as error:
             message = str(error)[:200]
             lowered = message.lower()
             status = (
@@ -655,4 +684,16 @@ class LLMPredictor:
             raise ValueError(
                 "questions and ground_truths must have the same length; "
                 f"got {len(questions)} and {len(ground_truths)}"
+            )
+
+    @staticmethod
+    def _validate_parse_retries(max_parse_retries: int) -> None:
+        if (
+            isinstance(max_parse_retries, bool)
+            or not isinstance(max_parse_retries, Integral)
+            or max_parse_retries < 1
+        ):
+            raise ValueError(
+                "max_parse_retries must be a positive integer; "
+                f"got {max_parse_retries!r}"
             )

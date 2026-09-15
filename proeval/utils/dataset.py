@@ -325,8 +325,8 @@ class Dataset:
             workers: Thread count for parallel mode.
             max_parse_retries: Retries per item.
             show_progress: Show a tqdm progress bar.
-            skip_error: ``True``: mark parse errors as NaN (excluded from
-                accuracy). ``False``: mark as 1.0 (counted as failure).
+            skip_error: ``True``: mark parse, backend, and rate-limit failures
+                as NaN (excluded from accuracy). ``False``: mark as 1.0.
 
         Returns:
             List of ``(question, ground_truth, raw_response, prediction,

@@ -410,17 +410,19 @@ predictor = LLMPredictor(
 )
 ```
 
-To use a third-party agent or inference harness, pass any client with a
-`predict` method. ProEval keeps ownership of prompting, JSON parsing, and
-scoring; the client only needs to return response text:
+To use a third-party agent or inference harness, pass a client with the small
+`PredictionClient` interface shown below. ProEval keeps ownership of prompting,
+JSON parsing, and scoring; the client must accept the forwarded keyword
+arguments and return response text as a `str`:
 
 ```python
 class AgentClient:
     def __init__(self, agent):
         self.agent = agent
 
-    def predict(self, prompt, **kwargs):
-        return self.agent.invoke(prompt)
+    def predict(self, prompt, *, model, max_tokens, response_format):
+        response = self.agent.invoke(prompt)
+        return response if isinstance(response, str) else response.content
 
 
 predictor = LLMPredictor(
@@ -428,6 +430,9 @@ predictor = LLMPredictor(
     client=AgentClient(agent),
 )
 ```
+
+Custom clients own transient inference retries. They must also be thread-safe
+when used with `parallel=True`; otherwise, run with `parallel=False`.
 
 ### Single Evaluation
 
@@ -451,7 +456,7 @@ results = predictor.predict_batch_parallel(
     dataset_config=DATASET_CONFIGS["strategyqa"],
     max_workers=10,       # Concurrent threads
     show_progress=True,   # tqdm progress bar
-    skip_error=False,     # True: mark parse errors as NaN; False: mark as 1.0
+    skip_error=False,     # True: mark evaluation failures as NaN; else 1.0
 )
 # results: list of (question, ground_truth, raw_response, prediction, score)
 ```
@@ -497,7 +502,7 @@ csv_mgr.run_evaluation(
     ground_truths=ground_truths,
     parallel=True,           # Use parallel API calls
     workers=10,              # Thread count
-    skip_error=False,        # True: NaN for parse errors, False: 1.0
+    skip_error=False,        # True: NaN for evaluation failures, else 1.0
     checkpoint_interval=50,  # Save every 50 items (sequential mode)
 )
 # If interrupted, re-run the same code — it resumes from checkpoint automatically
@@ -507,7 +512,7 @@ csv_mgr.run_evaluation(
 | --------------------- | ------ | ------- | ----------------------------------------------------------------------------------------- |
 | `parallel`            | `bool` | `True`  | Use `predict_batch_parallel` for faster processing                                        |
 | `workers`             | `int`  | `10`    | Thread count for parallel mode                                                            |
-| `skip_error`          | `bool` | `False` | `True`: mark parse errors as NaN (excluded from accuracy). `False`: mark as 1.0 (failure) |
+| `skip_error`          | `bool` | `False` | `True`: mark evaluation failures as NaN (excluded from accuracy). `False`: mark as 1.0 |
 | `rerun`               | `bool` | `False` | Force re-evaluation even if model columns exist                                           |
 | `checkpoint_interval` | `int`  | `50`    | Save checkpoint every N items (sequential mode only)                                      |
 

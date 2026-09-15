@@ -18,8 +18,8 @@ import math
 
 import pytest
 
-from proeval import Dataset, LLMPredictor, PredictionClient
-from proeval.evaluator import DATASET_CONFIGS
+from proeval import Dataset, LLMPredictor, PredictionClientError
+from proeval.evaluator import DATASET_CONFIGS, DatasetConfig, UnifiedCSVManager
 
 
 class _StubClient:
@@ -28,8 +28,15 @@ class _StubClient:
         self.error = error
         self.calls = []
 
-    def predict(self, prompt, **kwargs):
-        self.calls.append((prompt, kwargs))
+    def predict(self, prompt, *, model, max_tokens, response_format):
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "model": model,
+                "max_tokens": max_tokens,
+                "response_format": response_format,
+            }
+        )
         if self.error is not None:
             raise self.error
         return self.responses.pop(0)
@@ -44,11 +51,12 @@ def test_custom_client_does_not_require_openrouter_key(monkeypatch):
         "Is the sky blue?", True, DATASET_CONFIGS["strategyqa"]
     )
 
-    assert isinstance(client, PredictionClient)
     assert raw == '{"reasoning": "clear day", "answer": "yes"}'
     assert prediction == "yes"
     assert score == 0.0
-    assert client.calls[0][1]["model"] == "local-agent"
+    assert client.calls[0]["model"] == "local-agent"
+    assert client.calls[0]["max_tokens"] == 8192
+    assert client.calls[0]["response_format"] == DATASET_CONFIGS["strategyqa"].json_schema
 
 
 def test_custom_client_and_openrouter_key_are_mutually_exclusive():
@@ -125,13 +133,14 @@ def test_inference_client_errors_propagate_from_single_evaluation():
         client=_StubClient(error=RuntimeError("backend unavailable")),
     )
 
-    with pytest.raises(RuntimeError, match="backend unavailable"):
+    with pytest.raises(PredictionClientError, match="backend unavailable") as exc_info:
         predictor.evaluate(
             "question",
             True,
             DATASET_CONFIGS["strategyqa"],
             max_parse_retries=1,
         )
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
 @pytest.mark.parametrize("parallel", [False, True])
@@ -155,3 +164,143 @@ def test_batch_normalizes_inference_client_errors(parallel):
     assert result[3] == "RATE_LIMITED"
     assert result[4] == 1.0
     assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize("method_name", ["predict_batch", "predict_batch_parallel"])
+def test_batch_rejects_invalid_parse_retry_count(method_name):
+    predictor = LLMPredictor(model="local-agent", client=_StubClient())
+    method = getattr(predictor, method_name)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        method(
+            ["question"],
+            [True],
+            DATASET_CONFIGS["strategyqa"],
+            max_parse_retries=0,
+            show_progress=False,
+        )
+
+
+@pytest.mark.parametrize("max_workers", [0, 1.5, True])
+def test_parallel_batch_rejects_invalid_worker_count(max_workers):
+    predictor = LLMPredictor(model="local-agent", client=_StubClient())
+
+    with pytest.raises(ValueError, match="positive integer"):
+        predictor.predict_batch_parallel(
+            ["question"],
+            [True],
+            DATASET_CONFIGS["strategyqa"],
+            max_workers=max_workers,
+            show_progress=False,
+        )
+
+
+def test_batch_does_not_normalize_configuration_errors():
+    def broken_prompt(_question):
+        raise ValueError("bad prompt config")
+
+    config = DatasetConfig(
+        name="broken",
+        prompt_template=broken_prompt,
+        json_schema={"type": "json_object"},
+        extract_prediction=lambda data: data["answer"],
+        extract_ground_truth=lambda value: value,
+        compare_predictions=lambda prediction, truth: 0.0,
+    )
+    predictor = LLMPredictor(model="local-agent", client=_StubClient())
+
+    with pytest.raises(ValueError, match="bad prompt config"):
+        predictor.predict_batch(
+            ["question"], [True], config, show_progress=False
+        )
+
+
+def test_prediction_client_must_return_text():
+    predictor = LLMPredictor(
+        model="local-agent",
+        client=_StubClient(responses=[{"answer": "yes"}]),
+    )
+
+    with pytest.raises(PredictionClientError, match="must return a string"):
+        predictor.evaluate(
+            "question",
+            True,
+            DATASET_CONFIGS["strategyqa"],
+            max_parse_retries=1,
+        )
+
+
+def test_parallel_batch_preserves_input_order_with_shared_client():
+    class _ThreadSafeClient:
+        def predict(self, prompt, *, model, max_tokens, response_format):
+            return '{"reasoning": "ok", "answer": "yes"}'
+
+    questions = [f"question-{index}" for index in range(8)]
+    predictor = LLMPredictor(model="local-agent", client=_ThreadSafeClient())
+
+    results = predictor.predict_batch_parallel(
+        questions,
+        [True] * len(questions),
+        DATASET_CONFIGS["strategyqa"],
+        max_workers=3,
+        show_progress=False,
+    )
+
+    assert [result[0] for result in results] == questions
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_csv_manager_normalizes_backend_errors_in_both_modes(tmp_path, parallel):
+    manager = UnifiedCSVManager("custom", output_dir=str(tmp_path))
+    manager.load_or_create(["question"], [True])
+    predictor = LLMPredictor(
+        model="local-agent",
+        client=_StubClient(error=RuntimeError("backend unavailable")),
+    )
+
+    manager.run_evaluation(
+        predictor,
+        model_name="candidate",
+        dataset_config=DATASET_CONFIGS["strategyqa"],
+        questions=["question"],
+        ground_truths=[True],
+        parallel=parallel,
+        workers=1,
+        max_parse_retries=1,
+    )
+
+    assert manager.df.loc[0, "prediction_candidate"] == "ERROR"
+    assert manager.df.loc[0, "label_candidate"] == 1.0
+
+
+def test_csv_manager_sequential_fix_uses_normalized_evaluation(tmp_path):
+    manager = UnifiedCSVManager("custom", output_dir=str(tmp_path))
+    manager.load_or_create(["question"], [True])
+    failing = LLMPredictor(model="local-agent", client=_StubClient(["not json"]))
+    manager.run_evaluation(
+        failing,
+        model_name="candidate",
+        dataset_config=DATASET_CONFIGS["strategyqa"],
+        questions=["question"],
+        ground_truths=[True],
+        parallel=False,
+        max_parse_retries=1,
+    )
+    assert manager.df.loc[0, "prediction_candidate"] == "PARSE_ERROR"
+
+    fixed = LLMPredictor(
+        model="local-agent",
+        client=_StubClient(['{"reasoning": "ok", "answer": "yes"}']),
+    )
+    manager.fix_errors(
+        fixed,
+        model_name="candidate",
+        dataset_config=DATASET_CONFIGS["strategyqa"],
+        questions=["question"],
+        ground_truths=[True],
+        parallel=False,
+        max_parse_retries=1,
+    )
+
+    assert manager.df.loc[0, "prediction_candidate"] == "yes"
+    assert manager.df.loc[0, "label_candidate"] == 0.0

@@ -44,6 +44,7 @@ from proeval.evaluator import (
     LLMPredictor,
     OpenRouterClient,
     PredictionClient,
+    PredictionClientError,
 )
 from proeval.generator import TopicAwareGenerator
 from proeval.sampler import BQPriorSampler, BQSampler, SamplingResult
@@ -57,6 +58,7 @@ __all__ = [
     "LLMPredictor",
     "OpenRouterClient",
     "PredictionClient",
+    "PredictionClientError",
     "Dataset",
     "DatasetConfig",
     "DATASET_CONFIGS",

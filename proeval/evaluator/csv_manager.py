@@ -48,13 +48,11 @@ Example — fix errors in existing CSV::
 import csv
 import json
 import os
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-
 
 # Numpy JSON serialisation helper
 
@@ -230,7 +228,7 @@ class UnifiedCSVManager:
             parallel: Use ``predict_batch_parallel`` (default True).
             workers: Thread count for parallel mode.
             max_parse_retries: Retries per item.
-            skip_error: Mark parse errors as NaN instead of 1.0.
+            skip_error: Mark evaluation failures as NaN instead of 1.0.
             rerun: Force re-evaluation even if columns exist.
             checkpoint_interval: Save checkpoint every N items (sequential).
         """
@@ -280,15 +278,17 @@ class UnifiedCSVManager:
                     skipped += sum(1 for r in batch_results if r[3] in self.ERROR_SENTINELS)
             else:
                 for idx in range(start_idx, len(questions)):
-                    raw, pred, score = predictor.evaluate(
-                        questions[idx], ground_truths[idx], dataset_config,
+                    result = predictor.predict_batch(
+                        [questions[idx]],
+                        [ground_truths[idx]],
+                        dataset_config,
+                        show_progress=False,
                         max_parse_retries=max_parse_retries,
-                    )
-                    if pred is None:
+                        skip_error=skip_error,
+                    )[0]
+                    if result[3] in self.ERROR_SENTINELS:
                         skipped += 1
-                        pred = "SKIPPED"
-                        score = float("nan") if skip_error else 1.0
-                    all_results.append((questions[idx], ground_truths[idx], raw, pred, score))
+                    all_results.append(result)
 
                     # Save checkpoint periodically
                     if (idx + 1) % checkpoint_interval == 0:
@@ -332,7 +332,7 @@ class UnifiedCSVManager:
         max_parse_retries: int = 5,
         skip_error: bool = False,
     ) -> None:
-        """Re-run only failed predictions (SKIPPED / ERROR / RATE_LIMITED).
+        """Re-run failed predictions, including parse and backend errors.
 
         Args:
             predictor: :class:`LLMPredictor` instance.
@@ -366,11 +366,15 @@ class UnifiedCSVManager:
         else:
             fix_results = []
             for q, gt in tqdm(zip(err_q, err_gt), total=len(err_q), desc="Fixing errors"):
-                raw, pred, score = predictor.evaluate(q, gt, dataset_config, max_parse_retries)
-                if pred is None:
-                    pred = "SKIPPED"
-                    score = float("nan") if skip_error else 1.0
-                fix_results.append((q, gt, raw, pred, score))
+                result = predictor.predict_batch(
+                    [q],
+                    [gt],
+                    dataset_config,
+                    show_progress=False,
+                    max_parse_retries=max_parse_retries,
+                    skip_error=skip_error,
+                )[0]
+                fix_results.append(result)
 
         preds = [r[3] for r in fix_results]
         labels = [r[4] for r in fix_results]
