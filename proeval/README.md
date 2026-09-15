@@ -27,6 +27,7 @@ need:
 ```bash
 git clone https://github.com/google-deepmind/proeval.git
 cd proeval
+python -m pip install --upgrade pip
 python -m pip install -e .
 python -m pip install -e ".[encoder]"  # BQEncoderSampler and encoder training
 python -m pip install -e ".[topics]"   # TopicAwareGenerator
@@ -735,7 +736,7 @@ python -m experiment.exp_performance_estimation \
 
 | Variable             | Description                                                               |
 | -------------------- | ------------------------------------------------------------------------- |
-| `OPENROUTER_API_KEY` | Required for `LLMPredictor`, `TopicAwareGenerator`, and embedding metrics |
+| `OPENROUTER_API_KEY` | Default credential for OpenRouter-backed evaluation, generation, and metrics; not needed when `LLMPredictor` receives a custom client |
 
 ## Available Data Files
 
