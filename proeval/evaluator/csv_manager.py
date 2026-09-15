@@ -117,7 +117,11 @@ class UnifiedCSVManager:
                 self.csv_path,
                 converters={"question": str, "ground_truth": str},
             )
-            self._validate_dataset_alignment(questions, ground_truths)
+            self._validate_dataset_alignment(
+                questions,
+                ground_truths,
+                allow_legacy_numeric_types=not os.path.exists(self.metadata_path),
+            )
             self._validate_dataset_metadata()
             # The converter read preserves exact CSV identity for validation,
             # but callers should see the same value types they supplied when
@@ -474,7 +478,11 @@ class UnifiedCSVManager:
             raise ValueError("DataFrame not initialised. Call load_or_create() first.")
 
     def _validate_dataset_alignment(
-        self, questions: List[Any], ground_truths: List[Any]
+        self,
+        questions: List[Any],
+        ground_truths: List[Any],
+        *,
+        allow_legacy_numeric_types: bool = False,
     ) -> None:
         """Ensure caller inputs exactly match the stored dataset and row order."""
         self._check_init()
@@ -509,6 +517,15 @@ class UnifiedCSVManager:
                 "truths, value types, and row order as the loaded CSV."
             )
 
+        # Older versions let pandas infer column types before saving, so an
+        # integer beside a missing value could be persisted as ``1.0``. Only
+        # sidecar-free legacy CSVs may use that representation, and only when
+        # pandas' conversion preserves the original numeric value exactly.
+        legacy_frame = (
+            pd.DataFrame({"question": questions, "ground_truth": ground_truths})
+            if allow_legacy_numeric_types
+            else None
+        )
         for column in required_columns:
             stored_values = [
                 self._csv_text(value) for value in self.df[column].tolist()
@@ -520,6 +537,16 @@ class UnifiedCSVManager:
             ):
                 if stored == supplied:
                     continue
+                if legacy_frame is not None:
+                    original = convert_numpy_types(supplied_source[row])
+                    legacy_value = convert_numpy_types(legacy_frame[column].iloc[row])
+                    if (
+                        isinstance(original, Real)
+                        and not isinstance(original, bool)
+                        and original == legacy_value
+                        and stored == self._csv_text(legacy_value)
+                    ):
+                        continue
                 raise ValueError(
                     f"Dataset mismatch at row {row} for {column!r}: "
                     f"CSV has {stored!r}, but the caller provided "
@@ -652,7 +679,7 @@ class UnifiedCSVManager:
         for row, result in enumerate(completed):
             if len(result) != 5:
                 raise invalid(f"result row {row}")
-            if isinstance(result[4], bool) or not isinstance(result[4], Real):
+            if not isinstance(result[4], Real):
                 raise invalid(f"result score at row {row}")
             try:
                 score = float(result[4])
@@ -697,8 +724,12 @@ class UnifiedCSVManager:
     @staticmethod
     def _checkpoint_json(value: Any) -> str:
         """Return the JSON representation used in checkpoint persistence."""
+        # JSON converts mapping keys to strings. Normalize through the same
+        # round trip before sorting, so mixed numeric/string keys compare to
+        # the legacy checkpoint without Python trying to order unlike types.
+        persisted = json.loads(json.dumps(convert_numpy_types(value)))
         return json.dumps(
-            convert_numpy_types(value),
+            persisted,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
