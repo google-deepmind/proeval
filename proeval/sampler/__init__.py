@@ -16,7 +16,7 @@
 
 Public API::
 
-    from proeval.sampler import BQPriorSampler, SamplingResult
+    from proeval.sampler import BQPriorSampler, SamplingPlan, SamplingResult
 
     sampler = BQPriorSampler(noise_variance=0.3)
     result = sampler.sample(predictions="svamp", target_model=0, budget=20)
@@ -31,6 +31,7 @@ from proeval.sampler.bq import (
     BQEncoderSampler,
     BQPriorSampler,
     BQSampler,
+    SamplingPlan,
     SamplingResult,
 )
 from proeval.sampler.data import (
@@ -48,6 +49,7 @@ __all__ = [
     "BQEncoderSampler",
     "BQPriorSampler",
     "BQSampler",
+    "SamplingPlan",
     "SamplingResult",
     "load_predictions",
     "load_embeddings",

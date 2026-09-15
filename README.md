@@ -102,6 +102,34 @@ From a source checkout, run the bundled example with:
 python experiment/sample_usage.py
 ```
 
+### Integrating an external evaluation harness
+
+Plan evaluations using only historical source-model scores, then send the
+selected IDs to any agent or inference benchmark. Source and target scores
+should use the same per-item metric convention (for example, `1=error` and
+`0=correct`).
+
+```python
+from proeval import BQPriorSampler
+
+# Rows are benchmark items; columns are previously evaluated source models.
+# A DataFrame's index is used as the stable item ID.
+plan = BQPriorSampler(noise_variance=0.3).plan(
+    source_scores=historical_scores,
+    budget=50,
+)
+
+# This loop can be replaced by any third-party agent or inference harness.
+target_scores = {
+    item_id: run_target_model(item_id)
+    for item_id in plan.item_ids
+}
+result = plan.estimate(target_scores)
+print(f"Estimated target error rate: {result.estimates[-1]:.4f}")
+```
+
+`estimate` also accepts a list or NumPy array ordered like `plan.item_ids`.
+
 ## Experiments
 
 Here is an example of how to run the experiments:

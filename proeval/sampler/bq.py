@@ -56,12 +56,14 @@ Example::
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Union
+from numbers import Integral
+from typing import Any, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
 from proeval.sampler.data import (
+    _prepare_score_features,
     extract_model_predictions,
     load_predictions,
     setup_train_test_split,
@@ -140,6 +142,84 @@ class SamplingResult:
         final_std = float(np.sqrt(max(self.integral_variance[-1], 0.0)))
         return final_std > threshold
 
+
+@dataclass(frozen=True)
+class SamplingPlan:
+    """A target-free BQ acquisition plan.
+
+    ``indices`` and ``item_ids`` are immutable tuples ordered by acquisition.
+    Evaluate exactly those items, then pass their scores to :meth:`estimate`
+    either in the same order or as a mapping keyed by item ID.
+
+    Attributes:
+        indices: Positional indices selected from the source score rows.
+        item_ids: IDs corresponding to ``indices``, in acquisition order.
+    """
+
+    indices: Tuple[int, ...]
+    item_ids: Tuple[Any, ...]
+    _test_x: np.ndarray = field(repr=False, compare=False)
+    _prior_mean: np.ndarray = field(repr=False, compare=False)
+    _prior_covariance: np.ndarray = field(repr=False, compare=False)
+    _noise_variance: float = field(repr=False, compare=False)
+
+    def estimate(
+        self,
+        scores: Union[Sequence[float], Mapping[Any, float], pd.Series, np.ndarray],
+    ) -> SamplingResult:
+        """Estimate performance from scores for the selected items.
+
+        Sequence inputs must follow acquisition order and contain exactly one
+        score per selected item. Mapping and Series inputs are aligned by
+        ``item_ids`` and must contain exactly the selected IDs.
+        """
+        if isinstance(scores, (Mapping, pd.Series)):
+            if isinstance(scores, pd.Series) and not scores.index.is_unique:
+                raise ValueError("scores Series index must contain unique item IDs")
+
+            expected_ids = set(self.item_ids)
+            actual_ids = set(scores.keys())
+            missing_ids = [
+                item_id for item_id in self.item_ids if item_id not in actual_ids
+            ]
+            unexpected_ids = [
+                item_id for item_id in actual_ids if item_id not in expected_ids
+            ]
+            if missing_ids or unexpected_ids:
+                details = []
+                if missing_ids:
+                    details.append(f"missing item IDs: {missing_ids!r}")
+                if unexpected_ids:
+                    details.append(f"unexpected item IDs: {unexpected_ids!r}")
+                raise ValueError(
+                    "scores are not aligned with the plan ("
+                    + "; ".join(details)
+                    + ")"
+                )
+            ordered_scores = [scores[item_id] for item_id in self.item_ids]
+        else:
+            ordered_scores = scores
+
+        try:
+            score_array = np.asarray(ordered_scores, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("scores must be numeric") from exc
+        if score_array.ndim != 1 or len(score_array) != len(self.indices):
+            raise ValueError(
+                "scores must be one-dimensional with one value per selected item; "
+                f"expected {len(self.indices)}, got shape {score_array.shape}"
+            )
+        if not np.all(np.isfinite(score_array)):
+            raise ValueError("scores must contain only finite values")
+
+        return _estimate_active_sampling(
+            self._test_x,
+            score_array,
+            self._prior_mean,
+            self._prior_covariance,
+            self.indices,
+            self._noise_variance,
+        )
 
 
 # Internal GP helpers
@@ -236,11 +316,162 @@ def _validate_active_sampling_budget(
     n_init: int, budget: int, n_samples: int
 ) -> None:
     """Validate active-sampling budget bounds before sampling."""
+    if (
+        isinstance(n_init, bool)
+        or not isinstance(n_init, Integral)
+        or isinstance(budget, bool)
+        or not isinstance(budget, Integral)
+    ):
+        raise ValueError(
+            "n_init and budget must be integers; "
+            f"got n_init={n_init!r}, budget={budget!r}"
+        )
     if not 0 <= n_init <= budget <= n_samples:
         raise ValueError(
             "expected 0 <= n_init <= budget <= n_samples; "
             f"got n_init={n_init}, budget={budget}, n_samples={n_samples}"
         )
+
+
+def _select_active_indices(
+    test_x: np.ndarray,
+    u: np.ndarray,
+    budget: int,
+    n_init: int,
+    noise_variance: float,
+    rng,
+) -> List[int]:
+    """Select SF items without consulting target scores."""
+    n_samples = test_x.shape[1]
+    _validate_active_sampling_budget(n_init, budget, n_samples)
+
+    # Optional random initialisation from "interesting" prior range.
+    good_indices = [i for i in range(len(u)) if 0.2 < u[i] < 0.6]
+    if len(good_indices) < n_init:
+        good_indices = list(range(n_samples))
+
+    labeled_indices: List[int] = []
+    if n_init > 0:
+        init_local = rng.choice(
+            len(good_indices), min(n_init, len(good_indices)), replace=False
+        )
+        labeled_indices = [good_indices[int(i)] for i in init_local]
+    unlabeled_indices = [i for i in range(n_samples) if i not in labeled_indices]
+
+    # Keep the rank-1 acquisition state aligned with any random initial points.
+    if labeled_indices:
+        train_x_init = test_x[:, labeled_indices]
+        k_t_inv = np.linalg.inv(
+            np.dot(train_x_init, train_x_init.T) / noise_variance
+            + np.eye(test_x.shape[0])
+        )
+    else:
+        k_t_inv = None
+
+    for _ in range(n_init, budget):
+        train_x_t = test_x[:, labeled_indices]
+        best_idx, k_t_inv = _variance_improvement(
+            train_x_t, k_t_inv, noise_variance, unlabeled_indices, test_x
+        )
+        labeled_indices.append(best_idx)
+        unlabeled_indices.remove(best_idx)
+
+    return labeled_indices
+
+
+def _estimate_active_sampling(
+    test_x: np.ndarray,
+    selected_scores: np.ndarray,
+    u: np.ndarray,
+    S: np.ndarray,
+    selected_indices: Sequence[int],
+    noise_variance: float,
+) -> SamplingResult:
+    """Compute every SF posterior prefix for a fixed acquisition plan."""
+    labeled_indices = list(selected_indices)
+    budget = len(labeled_indices)
+    n_samples = test_x.shape[1]
+    estimates = np.ones(budget) * np.mean(u)
+    rounded_estimates = np.ones(budget) * np.mean(np.round(u))
+
+    true_prior_integral_var = np.sum(S) / (n_samples * n_samples)
+    integral_variance = np.ones(budget) * true_prior_integral_var
+    mu_x = np.mean(test_x, axis=1, keepdims=True)
+
+    for t in range(budget):
+        idx_slice = labeled_indices[: t + 1]
+        score_slice = selected_scores[: t + 1]
+        u_t, _ = _get_posterior(
+            test_x[:, idx_slice],
+            score_slice,
+            test_x,
+            noise_variance,
+            idx_slice,
+            u,
+        )
+        _, s_mu = _get_posterior(
+            test_x[:, idx_slice],
+            score_slice,
+            mu_x,
+            noise_variance,
+            idx_slice,
+            u,
+        )
+        rounded_estimates[t] = np.mean(np.round(u_t))
+        estimates[t] = np.mean(u_t)
+        integral_variance[t] = np.maximum(s_mu[0], 0.0)
+
+    if labeled_indices:
+        final_u, final_s = _get_posterior(
+            test_x[:, labeled_indices],
+            selected_scores,
+            test_x,
+            noise_variance,
+            labeled_indices,
+            u,
+        )
+    else:
+        final_u, final_s = u, np.diag(S)
+
+    return SamplingResult(
+        estimates=estimates,
+        rounded_estimates=rounded_estimates,
+        selected_indices=labeled_indices,
+        posterior_mean=final_u,
+        posterior_var=final_s,
+        prior_mean=u,
+        integral_variance=integral_variance,
+    )
+
+
+def _make_sampling_plan(
+    test_x: np.ndarray,
+    u: np.ndarray,
+    S: np.ndarray,
+    budget: int,
+    n_init: int,
+    noise_variance: float,
+    item_ids: Sequence[Any],
+    rng,
+) -> SamplingPlan:
+    """Build a :class:`SamplingPlan` from prepared SF features."""
+    indices = _select_active_indices(
+        test_x,
+        u,
+        budget=budget,
+        n_init=n_init,
+        noise_variance=noise_variance,
+        rng=rng,
+    )
+    return SamplingPlan(
+        indices=tuple(indices),
+        item_ids=tuple(item_ids[index] for index in indices),
+        _test_x=test_x,
+        _prior_mean=u,
+        _prior_covariance=S,
+        _noise_variance=noise_variance,
+    )
+
 
 def _bq_active_sampling(
     test_x: np.ndarray,
@@ -256,94 +487,23 @@ def _bq_active_sampling(
     Returns a :class:`SamplingResult` with posterior-mean estimates at each
     step, the acquisition-order indices, and the final posterior.
     """
-    n_samples = test_x.shape[1]
-    _validate_active_sampling_budget(n_init, budget, n_samples)
-
-    # Optional random initialisation from "interesting" prior range
-    good_indices = [i for i in range(len(u)) if 0.2 < u[i] < 0.6]
-    if len(good_indices) < n_init:
-        good_indices = list(range(n_samples))
-
-    labeled_indices: List[int] = []
-    if n_init > 0:
-        init_local = np.random.choice(len(good_indices), min(n_init, len(good_indices)), replace=False)
-        labeled_indices = [good_indices[int(i)] for i in init_local]
-    unlabeled_indices = [i for i in range(n_samples) if i not in labeled_indices]
-
-    estimates = np.ones(budget) * np.mean(u)
-    rounded_estimates = np.ones(budget) * np.mean(np.round(u))
-    
-    true_prior_integral_var = np.sum(S) / (n_samples * n_samples)
-    integral_variance = np.ones(budget) * true_prior_integral_var
-    mu_x = np.mean(test_x, axis=1, keepdims=True)
-
-    # Keep the rank-1 acquisition state aligned with any random initial points.
-    if labeled_indices:
-        train_x_init = test_x[:, labeled_indices]
-        k_t_inv = np.linalg.inv(
-            np.dot(train_x_init, train_x_init.T) / noise_variance
-            + np.eye(test_x.shape[0])
-        )
-    else:
-        k_t_inv = None
-
-    for t in range(n_init, budget):
-        # Acquire first so estimates[t] represents the posterior after t + 1
-        # actual target evaluations. The zero-sample state remains available
-        # separately through result.prior_mean.
-        train_x_t = test_x[:, labeled_indices]
-        best_idx, k_t_inv = _variance_improvement(
-            train_x_t, k_t_inv, noise_variance, unlabeled_indices, test_x
-        )
-        labeled_indices.append(best_idx)
-        unlabeled_indices.remove(best_idx)
-
-        train_x_t = test_x[:, labeled_indices]
-        train_y_t = test_y[labeled_indices]
-        u_t, _ = _get_posterior(
-            train_x_t, train_y_t, test_x, noise_variance, labeled_indices, u
-        )
-        _, s_mu = _get_posterior(
-            train_x_t, train_y_t, mu_x, noise_variance, labeled_indices, u
-        )
-
-        rounded_estimates[t] = np.mean(np.round(u_t))
-        estimates[t] = np.mean(u_t)
-        # Integral variance is variance of the mean
-        integral_variance[t] = np.maximum(s_mu[0], 0.0)
-
-    # Back-fill initial steps
-    for t in range(n_init):
-        idx_slice = labeled_indices[: t + 1]
-        u_t, s_t = _get_posterior(
-            test_x[:, idx_slice], test_y[idx_slice], test_x,
-            noise_variance, idx_slice, u,
-        )
-        _, s_mu = _get_posterior(
-            test_x[:, idx_slice], test_y[idx_slice], mu_x,
-            noise_variance, idx_slice, u,
-        )
-        rounded_estimates[t] = np.mean(np.round(u_t))
-        estimates[t] = np.mean(u_t)
-        integral_variance[t] = np.maximum(s_mu[0], 0.0)
-
-    # Final posterior
-    if labeled_indices:
-        final_u, final_s = _get_posterior(
-            test_x[:, labeled_indices], test_y[labeled_indices],
-            test_x, noise_variance, labeled_indices, u,
-        )
-    else:
-        final_u, final_s = u, np.diag(S)
-
-    return SamplingResult(
-        estimates=estimates,
-        rounded_estimates=rounded_estimates,
-        selected_indices=labeled_indices,
-        posterior_mean=final_u,
-        posterior_var=final_s,
-        prior_mean=u,
-        integral_variance=integral_variance,
+    plan = _make_sampling_plan(
+        test_x,
+        u,
+        S,
+        budget=budget,
+        n_init=n_init,
+        noise_variance=noise_variance,
+        item_ids=list(range(test_x.shape[1])),
+        rng=np.random,
+    )
+    return _estimate_active_sampling(
+        test_x,
+        np.asarray(test_y)[list(plan.indices)],
+        u,
+        S,
+        plan.indices,
+        noise_variance,
     )
 
 
@@ -371,7 +531,7 @@ def _bq_random_sampling(
     all_indices = list(np.random.choice(n_samples, min(budget, n_samples), replace=False))
 
     estimates = np.ones(budget) * np.mean(u)
-    
+
     true_prior_integral_var = np.sum(S) / (n_samples * n_samples)
     integral_variance = np.ones(budget) * true_prior_integral_var
     mu_x = np.mean(test_x, axis=1, keepdims=True)
@@ -557,7 +717,9 @@ def _bq_matern_active_sampling(
 
     labeled_indices: List[int] = []
     if n_init > 0:
-        init_local = np.random.choice(len(good_indices), min(n_init, len(good_indices)), replace=False)
+        init_local = np.random.choice(
+            len(good_indices), min(n_init, len(good_indices)), replace=False
+        )
         labeled_indices = [good_indices[int(i)] for i in init_local]
     unlabeled_indices = [i for i in range(n_samples) if i not in labeled_indices]
 
@@ -702,6 +864,81 @@ def _bq_matern_random_sampling(
 
 
 # Public API
+
+
+def _contains_missing_id_component(item_id: Any) -> bool:
+    """Return whether an item ID, including a tuple ID, contains a missing value."""
+    if item_id is None:
+        return True
+    if isinstance(item_id, tuple):
+        return any(_contains_missing_id_component(component) for component in item_id)
+
+    try:
+        missing = pd.isna(item_id)
+        if isinstance(missing, (bool, np.bool_)):
+            return bool(missing)
+        return bool(np.asarray(missing, dtype=bool).any())
+    except (TypeError, ValueError):
+        return False
+
+
+def _validate_plan_inputs(
+    source_scores: Union[np.ndarray, pd.DataFrame],
+    item_ids: Optional[Sequence[Any]],
+) -> Tuple[np.ndarray, List[Any]]:
+    """Validate and normalize source scores and row IDs for planning."""
+    try:
+        # Match the row-major matrix produced by ``extract_model_predictions``.
+        # Stable memory layout also avoids tie-breaking drift in linear algebra.
+        score_array = np.ascontiguousarray(source_scores, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("source_scores must contain only numeric values") from exc
+    if score_array.ndim != 2:
+        raise ValueError(
+            "source_scores must be a two-dimensional array with shape "
+            f"(n_items, n_source_models); got shape {score_array.shape}"
+        )
+    n_items, n_sources = score_array.shape
+    if n_items == 0:
+        raise ValueError("source_scores must contain at least one item")
+    if n_sources < 2:
+        raise ValueError("source_scores must contain at least two source models")
+    if not np.all(np.isfinite(score_array)):
+        raise ValueError("source_scores must contain only finite values")
+
+    if item_ids is None:
+        if isinstance(source_scores, pd.DataFrame):
+            normalized_ids = list(source_scores.index)
+        else:
+            normalized_ids = list(range(n_items))
+    else:
+        if isinstance(item_ids, (str, bytes)):
+            raise ValueError("item_ids must contain one ID per source_scores row")
+        try:
+            normalized_ids = list(item_ids)
+        except TypeError as exc:
+            raise ValueError("item_ids must contain one ID per source_scores row") from exc
+
+    if len(normalized_ids) != n_items:
+        raise ValueError(
+            "item_ids must contain one ID per source_scores row; "
+            f"expected {n_items}, got {len(normalized_ids)}"
+        )
+
+    for item_id in normalized_ids:
+        if _contains_missing_id_component(item_id):
+            raise ValueError("item_ids must not contain missing values")
+
+    try:
+        unique_ids = set(normalized_ids)
+    except TypeError as exc:
+        raise ValueError("item_ids must be hashable") from exc
+    if len(unique_ids) != n_items:
+        raise ValueError("item_ids must be unique")
+
+    return score_array, normalized_ids
+
+
 class BQPriorSampler:
     """Bayesian Quadrature active sampler with learned prior.
 
@@ -725,6 +962,48 @@ class BQPriorSampler:
     ):
         self.noise_variance = noise_variance
         self.n_init = n_init
+
+    def plan(
+        self,
+        source_scores: Union[np.ndarray, pd.DataFrame],
+        budget: int,
+        item_ids: Optional[Sequence[Any]] = None,
+        seed: Optional[int] = None,
+    ) -> SamplingPlan:
+        """Create a target-free acquisition plan from source-model scores.
+
+        Args:
+            source_scores: Numeric scores with shape
+                ``(n_items, n_source_models)``. These are historical or source
+                model scores; target-model scores are not needed for planning.
+            budget: Number of items to select.
+            item_ids: Optional stable ID for each row. A DataFrame's index is
+                used by default; arrays use positional integer IDs.
+            seed: Seed for random initial selection when ``n_init > 0``.
+
+        Returns:
+            A :class:`SamplingPlan`. Evaluate ``plan.item_ids`` and call
+            :meth:`SamplingPlan.estimate` with the resulting scores.
+        """
+        score_array, normalized_ids = _validate_plan_inputs(source_scores, item_ids)
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, Integral)
+            or budget < 1
+        ):
+            raise ValueError(f"budget must be a positive integer; got {budget!r}")
+        test_x, u, S = _prepare_score_features(score_array)
+        rng = np.random if seed is None else np.random.RandomState(seed)
+        return _make_sampling_plan(
+            test_x,
+            u,
+            S,
+            budget=budget,
+            n_init=self.n_init,
+            noise_variance=self.noise_variance,
+            item_ids=normalized_ids,
+            rng=rng,
+        )
 
     def sample(
         self,
