@@ -25,6 +25,25 @@ import numpy as np
 import pandas as pd
 
 
+def _prepare_score_features(
+    source_scores: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Prepare the linear-kernel features and prior from source scores."""
+    prior_mean = np.mean(source_scores, axis=1)
+    prior_covariance = np.cov(source_scores)
+    if prior_covariance.ndim == 0:
+        prior_covariance = np.array([[prior_covariance]])
+
+    test_x = source_scores.T
+    n_sources = test_x.shape[0]
+    if n_sources > 1:
+        test_x = (test_x - prior_mean) / np.sqrt(n_sources - 1)
+    else:
+        test_x = test_x - prior_mean
+
+    return test_x, prior_mean, prior_covariance
+
+
 def _default_data_dir() -> str:
     """Resolve the default data directory (data/)."""
     return os.path.join(
@@ -170,16 +189,6 @@ def setup_train_test_split(
             axis=1,
         )
 
-    u = np.mean(pretrain_matrix, axis=1)
-    S = np.cov(pretrain_matrix)
-    if S.ndim == 0:
-        S = np.array([[S]])
-
-    test_x = pretrain_matrix.T
-    n_pretrain = test_x.shape[0]
-    if n_pretrain > 1:
-        test_x = (test_x - u) / np.sqrt(n_pretrain - 1)
-    else:
-        test_x = test_x - u
+    test_x, u, S = _prepare_score_features(pretrain_matrix)
 
     return pretrain_matrix, test_x, test_y, u, S
