@@ -410,6 +410,25 @@ predictor = LLMPredictor(
 )
 ```
 
+To use a third-party agent or inference harness, pass any client with a
+`predict` method. ProEval keeps ownership of prompting, JSON parsing, and
+scoring; the client only needs to return response text:
+
+```python
+class AgentClient:
+    def __init__(self, agent):
+        self.agent = agent
+
+    def predict(self, prompt, **kwargs):
+        return self.agent.invoke(prompt)
+
+
+predictor = LLMPredictor(
+    model="my-agent",
+    client=AgentClient(agent),
+)
+```
+
 ### Single Evaluation
 
 ```python

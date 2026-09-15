@@ -354,6 +354,8 @@ class Dataset:
             self.ground_truths,
             self.config,
             show_progress=show_progress,
+            max_parse_retries=max_parse_retries,
+            skip_error=skip_error,
         )
 
     # Sampling data accessors

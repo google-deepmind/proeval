@@ -20,7 +20,12 @@ Public API::
     from proeval.evaluator import UnifiedCSVManager, load_dataset_data
 """
 
-from proeval.evaluator.client import MODEL_MAPPING, OpenRouterClient, resolve_model_name
+from proeval.evaluator.client import (
+    MODEL_MAPPING,
+    OpenRouterClient,
+    PredictionClient,
+    resolve_model_name,
+)
 from proeval.evaluator.csv_manager import (
     UnifiedCSVManager,
     convert_numpy_types,
@@ -45,6 +50,7 @@ from proeval.evaluator.predictor import (
 
 __all__ = [
     "OpenRouterClient",
+    "PredictionClient",
     "MODEL_MAPPING",
     "resolve_model_name",
     "LLMPredictor",

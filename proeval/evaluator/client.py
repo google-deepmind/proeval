@@ -21,9 +21,30 @@ vision (image) inputs.  Used by both the evaluator and generator modules.
 import base64
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
 import requests
+
+
+@runtime_checkable
+class PredictionClient(Protocol):
+    """Minimal inference backend accepted by :class:`LLMPredictor`.
+
+    Third-party agents and benchmark harnesses can implement this protocol to
+    use ProEval's prompting, parsing, and scoring without routing requests
+    through OpenRouter. Implementations may ignore keyword arguments that are
+    not relevant to their backend.
+    """
+
+    def predict(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        max_tokens: int,
+        response_format: Optional[Dict[str, Any]],
+    ) -> str:
+        """Return the model response text for *prompt*."""
 
 
 # Model name mapping
