@@ -73,11 +73,11 @@ def load_benchmark_data(
     for name in model_names:
         y_raw = df[f"label_{name}"].values
         # Use raw labels: 1=error, 0=correct.
-        # For DICES/DICES_T2I: continuous ratings → binarise at 0.5,
-        # then invert so 1=unsafe/poor (error) and 0=safe/good (correct).
+        # For DICES/DICES_T2I, continuous error scores at or above 0.5 count
+        # as failures, matching the failure-discovery threshold.
         # For other datasets: raw labels are already 1=error, 0=correct.
         if benchmark_name in ("dices", "dices_t2i"):
-            y_error = (y_raw < 0.5).astype(float)
+            y_error = (y_raw >= 0.5).astype(float)
         else:
             y_error = y_raw
         labels.append(y_error)
