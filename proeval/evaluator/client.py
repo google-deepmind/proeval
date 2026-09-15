@@ -21,9 +21,33 @@ vision (image) inputs.  Used by both the evaluator and generator modules.
 import base64
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol
 
 import requests
+
+
+class PredictionClient(Protocol):
+    """Minimal inference backend accepted by :class:`LLMPredictor`.
+
+    Third-party agents and benchmark harnesses can implement this protocol to
+    use ProEval's prompting, parsing, and scoring without routing requests
+    through OpenRouter. Implementations may ignore keyword arguments that are
+    not relevant to their backend.
+    """
+
+    def predict(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        max_tokens: int,
+        response_format: Optional[Dict[str, Any]],
+    ) -> str:
+        """Return the model response text for *prompt*."""
+
+
+class PredictionClientError(RuntimeError):
+    """Raised when an inference backend fails or returns an invalid value."""
 
 
 # Model name mapping
@@ -131,8 +155,10 @@ class OpenRouterClient:
                     timeout=60,
                 )
 
-                # Cascading JSON-mode fallback on 400 or 429
-                if resp.status_code in (400, 429) and "response_format" in payload:
+                # A 400 may mean that the model does not support the requested
+                # structured-output mode. A 429 is a transient rate limit and
+                # must retain the original payload for the next retry.
+                if resp.status_code == 400 and "response_format" in payload:
                     cur = payload.get("response_format", {})
                     if cur.get("type") == "json_schema":
                         payload["response_format"] = {"type": "json_object"}
@@ -142,7 +168,7 @@ class OpenRouterClient:
                             json=payload,
                             timeout=60,
                         )
-                    if resp.status_code in (400, 429):
+                    if resp.status_code == 400:
                         del payload["response_format"]
                         resp = requests.post(
                             f"{self.base_url}/chat/completions",
@@ -165,9 +191,9 @@ class OpenRouterClient:
 
             except Exception as e:
                 if self._is_rate_limit(e):
-                    wait = retry_delay * (2 ** (attempt + 2))
-                    time.sleep(wait)
                     if attempt < max_retries - 1:
+                        wait = retry_delay * (2 ** (attempt + 2))
+                        time.sleep(wait)
                         continue
                 if attempt == max_retries - 1:
                     raise
@@ -219,9 +245,9 @@ class OpenRouterClient:
                 return data["choices"][0]["message"]["content"]
             except Exception as e:
                 if self._is_rate_limit(e):
-                    wait = retry_delay * (2 ** (attempt + 3))
-                    time.sleep(wait)
                     if attempt < max_retries - 1:
+                        wait = retry_delay * (2 ** (attempt + 3))
+                        time.sleep(wait)
                         continue
                 if attempt == max_retries - 1:
                     raise

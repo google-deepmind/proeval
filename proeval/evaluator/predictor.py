@@ -21,16 +21,20 @@ DICES-T2I), using configurable :class:`DatasetConfig` objects.
 
 import json
 import re
-import time
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
-from proeval.evaluator.client import OpenRouterClient
-
+from proeval.evaluator.client import (
+    OpenRouterClient,
+    PredictionClient,
+    PredictionClientError,
+)
 
 # Prompt templates
 
@@ -406,9 +410,26 @@ class LLMPredictor:
         )
     """
 
-    def __init__(self, model: str = "anthropic/claude-3.5-sonnet", api_key: Optional[str] = None):
+    def __init__(
+        self,
+        model: str = "anthropic/claude-3.5-sonnet",
+        api_key: Optional[str] = None,
+        client: Optional[PredictionClient] = None,
+    ):
+        """Create a predictor backed by OpenRouter or a custom client.
+
+        Args:
+            model: Model identifier forwarded to the inference client.
+            api_key: OpenRouter API key. May only be supplied when *client* is
+                omitted.
+            client: Custom inference backend implementing
+                :class:`~proeval.evaluator.PredictionClient`. When omitted,
+                :class:`~proeval.evaluator.OpenRouterClient` is created.
+        """
+        if client is not None and api_key is not None:
+            raise ValueError("api_key cannot be used together with a custom client")
         self.model = model
-        self.client = OpenRouterClient(api_key=api_key)
+        self.client = client if client is not None else OpenRouterClient(api_key=api_key)
 
     # Single evaluation
 
@@ -421,35 +442,58 @@ class LLMPredictor:
     ) -> Tuple[Optional[str], Optional[Any], Optional[float]]:
         """Evaluate a single question using *dataset_config*.
 
-        Returns ``(raw_response, prediction, error_score)``.
-        Returns ``(raw_response, "PARSE_ERROR", 1.0)`` if parsing fails
-        after all retries (preserves raw response for debugging).
+        Returns ``(raw_response, prediction, error_score)``. If parsing fails
+        after all retries, *prediction* and *error_score* are ``None`` while
+        the last raw response is preserved for debugging. Batch methods turn
+        this state into a ``"PARSE_ERROR"`` result with the requested score.
+
+        Raises:
+            PredictionClientError: If the inference client fails or does not
+                return a string. Custom clients own any transient retries.
+            ValueError: If *max_parse_retries* is not a positive integer.
         """
+        self._validate_parse_retries(max_parse_retries)
         prompt = dataset_config.prompt_template(question)
-        last_response = None
+        last_response: Optional[str] = None
 
         for attempt in range(max_parse_retries):
+            # Inference failures are not parse failures. Let single-item
+            # callers handle them directly; batch methods convert them into a
+            # per-item error result so the rest of the batch can continue.
             try:
                 response = self.client.predict(
-                    prompt, model=self.model,
+                    prompt,
+                    model=self.model,
                     response_format=dataset_config.json_schema,
                     max_tokens=8192,
                 )
-                last_response = response
-                if not response or not response.strip():
+            except Exception as error:
+                raise PredictionClientError(str(error)) from error
+            if not isinstance(response, str):
+                raise PredictionClientError(
+                    "prediction client must return a string; "
+                    f"got {type(response).__name__}"
+                )
+            last_response = response
+
+            if not response.strip():
+                if attempt < max_parse_retries - 1:
                     time.sleep(1.0 * (2 ** attempt))
-                    continue
+                continue
 
-                cleaned = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
-                cleaned = re.sub(r"```(?:json)?\s*\n?", "", cleaned).strip()
-                cleaned = cleaned.lstrip("\ufeff\u200b\u200c\u200d\u2060\u00a0")
-                m = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", cleaned)
-                if m:
-                    cleaned = m.group(0)
-                cleaned = re.sub(r"(\{|,)\s*([a-zA-Z_]\w*)\s*:", r'\1"\2":', cleaned)
+            cleaned = re.sub(
+                r"<think>.*?</think>", "", response, flags=re.DOTALL
+            ).strip()
+            cleaned = re.sub(r"```(?:json)?\s*\n?", "", cleaned).strip()
+            cleaned = cleaned.lstrip("\ufeff\u200b\u200c\u200d\u2060\u00a0")
+            match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", cleaned)
+            if match:
+                cleaned = match.group(0)
+            cleaned = re.sub(r"(\{|,)\s*([a-zA-Z_]\w*)\s*:", r'\1"\2":', cleaned)
 
+            prediction = None
+            try:
                 # Try parsing without quote mangling first (preserves apostrophes)
-                data = None
                 try:
                     data = json.loads(cleaned)
                 except json.JSONDecodeError:
@@ -457,35 +501,32 @@ class LLMPredictor:
                     # Only replace quotes at JSON structural positions, not apostrophes
                     alt = re.sub(r"(?<=[\{,:])\s*'|'\s*(?=[:,\}])", '"', cleaned)
                     data = json.loads(alt)
-
                 prediction = dataset_config.extract_prediction(data)
-
-                if prediction and len(str(prediction)) > 50:
-                    time.sleep(1.0 * (2 ** attempt))
-                    continue
-
-                gt_cleaned = dataset_config.extract_ground_truth(ground_truth)
-                score = dataset_config.compare_predictions(prediction, gt_cleaned)
-                return response, prediction, score
-
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 # Regex fallback
-                for txt in [cleaned, response]:
+                for text in (cleaned, response):
                     for field in ("answer", "is_toxic", "rating"):
                         pat = rf'"{field}"\s*:\s*"?([^",}}\n]+)"?'
-                        fm = re.search(pat, txt)
-                        if fm:
-                            fb = fm.group(1).strip().strip('"')
-                            if fb.lower() in ("null", "none", ""):
+                        fallback_match = re.search(pat, text)
+                        if fallback_match:
+                            fallback = fallback_match.group(1).strip().strip('"')
+                            if fallback.lower() in ("null", "none", ""):
                                 continue
-                            gt_cleaned = dataset_config.extract_ground_truth(ground_truth)
-                            score = dataset_config.compare_predictions(fb, gt_cleaned)
-                            return response, fb, score
+                            prediction = fallback
+                            break
+                    if prediction is not None:
+                        break
+
+            if prediction is None or (prediction and len(str(prediction)) > 50):
                 if attempt < max_parse_retries - 1:
                     time.sleep(1.0 * (2 ** attempt))
-            except Exception:
-                if attempt < max_parse_retries - 1:
-                    time.sleep(1.0 * (2 ** attempt))
+                continue
+
+            ground_truth_cleaned = dataset_config.extract_ground_truth(ground_truth)
+            score = dataset_config.compare_predictions(
+                prediction, ground_truth_cleaned
+            )
+            return response, prediction, score
 
         return last_response, None, None
 
@@ -497,8 +538,17 @@ class LLMPredictor:
         ground_truths: List[Any],
         dataset_config: DatasetConfig,
         show_progress: bool = True,
+        max_parse_retries: int = 3,
+        skip_error: bool = False,
     ) -> List[Tuple[str, Any, str, Any, float]]:
-        """Sequential batch evaluation."""
+        """Sequential batch evaluation.
+
+        Parse failures are returned as ``"PARSE_ERROR"`` and backend failures
+        as ``"ERROR"`` or ``"RATE_LIMITED"``. Failures are scored as 1.0,
+        or as NaN when *skip_error* is true.
+        """
+        self._validate_batch_lengths(questions, ground_truths)
+        self._validate_parse_retries(max_parse_retries)
         results = []
         it = (
             tqdm(zip(questions, ground_truths), total=len(questions), desc=f"Evaluating {dataset_config.name}")
@@ -506,8 +556,14 @@ class LLMPredictor:
             else zip(questions, ground_truths)
         )
         for q, gt in it:
-            raw, pred, score = self.evaluate(q, gt, dataset_config)
-            results.append((q, gt, raw, pred if pred is not None else "PARSE_ERROR", score))
+            result = self._evaluate_batch_item(
+                q,
+                gt,
+                dataset_config,
+                max_parse_retries,
+                skip_error,
+            )
+            results.append(result)
         return results
 
     def predict_dataset(
@@ -544,31 +600,37 @@ class LLMPredictor:
         show_progress: bool = True,
         skip_error: bool = False,
     ) -> List[Tuple[str, Any, str, Any, float]]:
-        """Parallel batch evaluation using ThreadPoolExecutor (5–10× faster)."""
+        """Parallel batch evaluation using ThreadPoolExecutor (5–10× faster).
+
+        Custom inference clients are shared across workers and must therefore
+        be thread-safe. Use sequential batching otherwise.
+        """
+        self._validate_batch_lengths(questions, ground_truths)
+        self._validate_parse_retries(max_parse_retries)
+        if (
+            isinstance(max_workers, bool)
+            or not isinstance(max_workers, Integral)
+            or max_workers < 1
+        ):
+            raise ValueError(
+                f"max_workers must be a positive integer; got {max_workers!r}"
+            )
         results: List[Optional[Tuple]] = [None] * len(questions)
         lock = threading.Lock()
         skipped = [0]
 
         def _worker(idx, q, gt):
-            for r429 in range(5):
-                try:
-                    raw, pred, score = self.evaluate(q, gt, dataset_config, max_parse_retries)
-                    if pred is None:
-                        with lock:
-                            skipped[0] += 1
-                        pred = "SKIPPED"
-                        score = float("nan") if skip_error else 1.0
-                    return idx, (q, gt, raw, pred, score)
-                except Exception as e:
-                    if "429" in str(e).lower() or "rate" in str(e).lower():
-                        time.sleep(2.0 * (2 ** r429))
-                        continue
-                    with lock:
-                        skipped[0] += 1
-                    return idx, (q, gt, str(e)[:200], "ERROR", float("nan") if skip_error else 1.0)
-            with lock:
-                skipped[0] += 1
-            return idx, (q, gt, "Rate limit exhausted", "RATE_LIMITED", float("nan") if skip_error else 1.0)
+            result = self._evaluate_batch_item(
+                q,
+                gt,
+                dataset_config,
+                max_parse_retries,
+                skip_error,
+            )
+            if result[3] in {"PARSE_ERROR", "ERROR", "RATE_LIMITED"}:
+                with lock:
+                    skipped[0] += 1
+            return idx, result
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futs = {pool.submit(_worker, i, q, gt): i for i, (q, gt) in enumerate(zip(questions, ground_truths))}
@@ -583,3 +645,55 @@ class LLMPredictor:
                 pbar.close()
 
         return [r for r in results if r is not None]
+
+    def _evaluate_batch_item(
+        self,
+        question: str,
+        ground_truth: Any,
+        dataset_config: DatasetConfig,
+        max_parse_retries: int,
+        skip_error: bool,
+    ) -> Tuple[str, Any, str, Any, float]:
+        error_score = float("nan") if skip_error else 1.0
+        try:
+            raw, prediction, score = self.evaluate(
+                question,
+                ground_truth,
+                dataset_config,
+                max_parse_retries=max_parse_retries,
+            )
+        except PredictionClientError as error:
+            message = str(error)[:200]
+            lowered = message.lower()
+            status = (
+                "RATE_LIMITED"
+                if "429" in lowered or "rate limit" in lowered
+                else "ERROR"
+            )
+            return question, ground_truth, message, status, error_score
+
+        if prediction is None:
+            return question, ground_truth, raw, "PARSE_ERROR", error_score
+        return question, ground_truth, raw, prediction, score
+
+    @staticmethod
+    def _validate_batch_lengths(
+        questions: List[str], ground_truths: List[Any]
+    ) -> None:
+        if len(questions) != len(ground_truths):
+            raise ValueError(
+                "questions and ground_truths must have the same length; "
+                f"got {len(questions)} and {len(ground_truths)}"
+            )
+
+    @staticmethod
+    def _validate_parse_retries(max_parse_retries: int) -> None:
+        if (
+            isinstance(max_parse_retries, bool)
+            or not isinstance(max_parse_retries, Integral)
+            or max_parse_retries < 1
+        ):
+            raise ValueError(
+                "max_parse_retries must be a positive integer; "
+                f"got {max_parse_retries!r}"
+            )

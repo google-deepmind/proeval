@@ -38,7 +38,14 @@ Quick start::
 
 __version__ = "0.1.0"
 
-from proeval.evaluator import DATASET_CONFIGS, DatasetConfig, LLMPredictor, OpenRouterClient
+from proeval.evaluator import (
+    DATASET_CONFIGS,
+    DatasetConfig,
+    LLMPredictor,
+    OpenRouterClient,
+    PredictionClient,
+    PredictionClientError,
+)
 from proeval.generator import TopicAwareGenerator
 from proeval.sampler import BQPriorSampler, BQSampler, SamplingPlan, SamplingResult
 from proeval.utils import Dataset
@@ -51,6 +58,8 @@ __all__ = [
     "TopicAwareGenerator",
     "LLMPredictor",
     "OpenRouterClient",
+    "PredictionClient",
+    "PredictionClientError",
     "Dataset",
     "DatasetConfig",
     "DATASET_CONFIGS",
