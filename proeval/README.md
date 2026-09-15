@@ -4,15 +4,36 @@ A Python library for efficient LLM evaluation through Bayesian Quadrature active
 
 ## Installation
 
+Install the latest published release from PyPI:
+
 ```bash
-# From the project root
-pip install numpy pandas scikit-learn torch requests tqdm bertopic hdbscan
+pip install proeval
 ```
+
+The published `0.1.0` release currently lags behind `main`. For the latest
+source code and the repository-only research data, clone the repository and
+install the extras you need:
+
+```bash
+git clone https://github.com/google-deepmind/proeval.git
+cd proeval
+pip install -e .
+pip install -e ".[encoder]"  # BQEncoderSampler and encoder training
+pip install -e ".[topics]"   # TopicAwareGenerator
+```
+
+The prediction CSVs and embeddings under `data/` are not included in PyPI
+distributions. Dataset-name shortcuts therefore require a source checkout or an
+explicit `data_dir`; installed-package users can always pass a DataFrame.
+The API examples below follow `main`.
 
 ## Quick Start
 
 ```python
-from proeval import BQPriorSampler, BQEncoderSampler, TopicAwareGenerator, LLMPredictor
+from proeval import BQPriorSampler, Dataset, LLMPredictor, TopicAwareGenerator
+
+# Optional encoder APIs; install the encoder extra before using these imports.
+from proeval.sampler import BQEncoderSampler
 from proeval.encoder import EncoderTrainer
 ```
 
@@ -20,7 +41,7 @@ from proeval.encoder import EncoderTrainer
 
 ## 1. BQPriorSampler — Active Sampling
 
-Efficiently estimate an LLM's accuracy using far fewer labeled samples than random sampling. Uses Bayesian Quadrature with a learned prior from other models' predictions.
+Efficiently estimate an LLM's error rate using far fewer labeled samples than random sampling. Uses Bayesian Quadrature with a learned prior from other models' predictions.
 
 ### Initialisation
 
@@ -47,6 +68,8 @@ result = sampler.sample(
     budget=50,                             # Number of samples to acquire
     data_dir=None,                         # Path to data directory (default: data/)
     pretrain_indices=None,                 # Specific model indices for pre-training prior
+    pretrain_mode="gmm",                  # "gmm" (default) or "all"
+    reference_benchmarks=None,             # Optional reference set for GMM
     seed=42,                               # Random seed for reproducibility
 )
 ```
@@ -57,18 +80,23 @@ result = sampler.sample(
 | `target_model`    | `int` or `str`       | `"gemini25_flash"`   | Name (preferred) or index of the model to target for testing                                                                           |
 | `budget`           | `int`                | `50`                 | Number of samples to actively acquire                                                                                                   |
 | `data_dir`         | `str`                | `None`               | Directory with `<dataset>_predictions.csv` files. Defaults to `data/`                                                               |
-| `pretrain_indices` | `list[int]`          | `None`               | Explicit list of model indices to use as prior features. If `None`, uses all models except the target model                              |
+| `pretrain_indices` | `list[int]`          | `None`               | Explicit model indices for prior features. If `None`, selection follows `pretrain_mode`                                                  |
+| `pretrain_mode`    | `str`                | `"gmm"`              | `"gmm"` selects models from named reference benchmarks; `"all"` uses every model except the target                                   |
+| `reference_benchmarks` | `list[str]`      | `None`               | Reference benchmarks for GMM selection. If `None`, discovers other prediction CSVs in `data_dir`                                        |
 | `seed`             | `int`                | `None`               | Random seed for reproducibility                                                                                                         |
 
 ### Pretrain Model Selection (GMM)
 
-By default, the sampler uses **all** available models (except the target) as pretrain features. For better accuracy, you can use **GMM clustering** to automatically select only the models most similar to the target model:
+For a named dataset, the sampler defaults to **GMM clustering** over the other
+prediction CSVs in `data_dir`. This automatically selects models most similar
+to the target model. For an unnamed DataFrame, pass `pretrain_mode="all"` or
+provide `pretrain_indices` explicitly.
 
 ```python
 from proeval.sampler.pretrain_selector import select_pretrain_models_gmm
 
 # Auto-select source models via GMM clustering on reference benchmarks
-selected_models, selected_indices = select_pretrain_models_gmm(
+selected_indices, selected_models = select_pretrain_models_gmm(
     target_benchmark="svamp",
     target_model="gemini25_flash",
     # reference_benchmarks=None,  # Auto-discovers from data_dir
@@ -110,23 +138,25 @@ from proeval.sampler import BQPriorSampler, load_predictions, extract_model_pred
 # Load data to get true mean
 df = load_predictions("svamp")
 pred_matrix, model_names = extract_model_predictions(df)
-true_mean = np.mean(pred_matrix[:, 0])
+target_model = "gemini25_flash"
+target_index = model_names.index(target_model)
+true_error_rate = np.mean(pred_matrix[:, target_index])
 
 # BQ active sampling
 sampler = BQPriorSampler(noise_variance=0.3)
-result = sampler.sample(predictions="svamp", target_model="gemini25_flash", budget=50, seed=42)
+result = sampler.sample(predictions="svamp", target_model=target_model, budget=50, seed=42)
 
-print(f"True accuracy: {true_mean:.4f}")
+print(f"True error rate: {true_error_rate:.4f}")
 print(f"BQ estimate:   {result.estimates[-1]:.4f}")
-print(f"BQ MAE:        {result.mae(true_mean):.4f}")
+print(f"BQ MAE:        {result.mae(true_error_rate):.4f}")
 
 # Compare with random baseline
 random_mae = np.mean([
-    abs(np.mean(pred_matrix[:, 0][np.random.choice(len(pred_matrix), 50, replace=False)]) - true_mean)
+    abs(np.mean(pred_matrix[:, target_index][np.random.choice(len(pred_matrix), 50, replace=False)]) - true_error_rate)
     for _ in range(10)
 ])
 print(f"Random MAE:    {random_mae:.4f}")
-print(f"Improvement:   {(1 - result.mae(true_mean) / random_mae) * 100:.1f}%")
+print(f"Improvement:   {(1 - result.mae(true_error_rate) / random_mae) * 100:.1f}%")
 ```
 
 ---
@@ -146,6 +176,7 @@ from proeval.sampler import BQEncoderSampler
 # Encoder trained on gsm8k+strategyqa, holdout=svamp
 sampler = BQEncoderSampler(
     encoder_path="path/to/encoder_holdout_svamp.pth",
+    embeddings_path="data/svamp_embeddings_text_embedding_3_large.npy",
     noise_variance=0.3,
     n_init=0,
 )
@@ -172,14 +203,17 @@ from proeval.sampler import BQEncoderSampler
 # Step 1: Train encoder (holdout = svamp)
 trainer = EncoderTrainer(
     train_benchmarks=["gsm8k", "strategyqa"],
-    holdout_benchmark="svamp",
+    target_benchmark="svamp",
     target_model="gemini25_flash",
     hidden_dim=16, kernel_type="matern", epochs=200,
 )
 encoder_path = trainer.train(data_dir="data")
 
 # Step 2: Sample on the holdout benchmark
-sampler = BQEncoderSampler(encoder_path=encoder_path)
+sampler = BQEncoderSampler(
+    encoder_path=encoder_path,
+    embeddings_path="data/svamp_embeddings_text_embedding_3_large.npy",
+)
 result = sampler.sample(
     predictions="svamp",
     target_model="gemini25_flash",
@@ -309,24 +343,23 @@ for i in range(5):
 
 ## 3. Dataset — Bring Your Own Data
 
-`Dataset` is the single object that flows through the whole pipeline —
-**prediction → sampling → generation**. It bundles **questions + ground truths
-+ a `DatasetConfig`**, and (when built from a predictions CSV) also exposes the
-prediction matrix and embeddings the sampler/generator need. Use it whenever you
-want to evaluate or sample on data that isn't already wired into
-`DATASET_CONFIGS`.
+`Dataset` bundles **questions + ground truths + a `DatasetConfig`** for model
+evaluation. When built from a predictions CSV, it also exposes the prediction
+matrix and embeddings used by the samplers. `TopicAwareGenerator` accepts a
+`Dataset` too, but generation currently supports only the GSM8K and StrategyQA
+prompt formats.
 
 ### Constructors
 
 ```python
 from proeval import Dataset, DATASET_CONFIGS, LLMPredictor
 
-# (a) Built-in: load one of the 10 built-in datasets from HuggingFace
+# (a) Configured dataset loader (requires the datasets extra for HF-backed data)
 ds = Dataset.from_builtin("svamp")
 
 # (b) From a pre-computed predictions CSV — offline, and the bridge to sampling.
 #     Carries questions/ground_truths AND the label_<model> matrix + embeddings.
-ds = Dataset.from_predictions("svamp")
+ds = Dataset.from_predictions("svamp", data_dir="path/to/proeval-data")
 
 # (c) From in-memory lists (simplest custom case)
 ds = Dataset.from_lists(
@@ -353,15 +386,15 @@ pass it via `config=...` and skip the four eval-function arguments. A `config`
 is only required for `predict()`; a `Dataset` built purely for sampling can omit
 it.
 
-### Use a Dataset everywhere
+### Use a Dataset for prediction and sampling
 
-A `Dataset` can be passed directly to the sampler and generator in place of a
-dataset-name string — one object carries the data through every stage:
+A `Dataset` built from predictions can be passed directly to a sampler in place
+of a dataset-name string:
 
 ```python
-from proeval import BQPriorSampler, TopicAwareGenerator
+from proeval import BQPriorSampler
 
-ds = Dataset.from_predictions("svamp")
+ds = Dataset.from_predictions("svamp", data_dir="path/to/proeval-data")
 
 # Sampling: equivalent to sample(predictions="svamp", ...), but the Dataset
 # also supplies its name (for GMM selection) and cached predictions.
@@ -372,12 +405,24 @@ result = BQPriorSampler(noise_variance=0.3).sample(
 # The accessors the sampler relies on are also available directly:
 matrix, model_names = ds.prediction_matrix()   # (n_samples, n_models), 1=failure
 embeddings = ds.embeddings()                    # (n_samples, d)
-
-# Generation: pass the Dataset as `df`; its name drives the prompt format.
-gen = TopicAwareGenerator(df=ds, prior_u=prior_u, prior_S=prior_S)
 ```
 
-Passing a name string or a raw DataFrame still works exactly as before.
+Passing a name string or a raw DataFrame to the sampler still works. A raw
+DataFrame does not carry a dataset name, so use `pretrain_mode="all"` or provide
+`pretrain_indices` explicitly.
+
+For generation, pass a GSM8K or StrategyQA `Dataset` as `df`. The generator uses
+that dataset's name to choose one of its two supported prompt formats:
+
+```python
+from proeval import TopicAwareGenerator
+
+gsm8k = Dataset.from_predictions("gsm8k", data_dir="path/to/proeval-data")
+gen = TopicAwareGenerator(df=gsm8k, prior_u=prior_u, prior_S=prior_S)
+```
+
+See the prior setup examples in the generator section above for `prior_u` and
+`prior_S`. Custom generation formats are not yet supported by this interface.
 
 ### Predict
 
@@ -545,7 +590,7 @@ from proeval.encoder import EncoderTrainer
 
 trainer = EncoderTrainer(
     train_benchmarks=["gsm8k", "strategyqa"],
-    holdout_benchmark="svamp",
+    target_benchmark="svamp",
     target_model="gemini25_flash",
     hidden_dim=16,
     kernel_type="matern",
@@ -558,7 +603,7 @@ encoder_path = trainer.train(data_dir="data", output_dir="results")
 | Parameter            | Type        | Default                  | Description                                    |
 | -------------------- | ----------- | ------------------------ | ---------------------------------------------- |
 | `train_benchmarks`   | `list[str]` | _required_               | Benchmarks for training                        |
-| `holdout_benchmark`  | `str`       | _required_               | Benchmark to hold out for testing              |
+| `target_benchmark`   | `str`       | _required_               | Benchmark to hold out for testing              |
 | `target_model`      | `str`       | `"gemini25_flash"`       | Model to evaluate for BQ testing               |
 | `hidden_dim`         | `int`       | `16`                     | Encoder hidden dimension                       |
 | `learning_rate`      | `float`     | `0.01`                   | Adam learning rate                             |
@@ -574,7 +619,7 @@ encoder_path = trainer.train(data_dir="data", output_dir="results")
 ```bash
 python -m experiment.exp_train_encoder \
     --train-benchmarks gsm8k strategyqa \
-    --holdout-benchmark svamp \
+    --target-benchmark svamp \
     --target-model gemini25_flash \
     --hidden-dim 16 --kernel-type matern --init-lengthscale 1.0 --epochs 200
 ```
@@ -644,7 +689,7 @@ Example:
 ```bash
 # Train encoder
 python -m experiment.exp_train_encoder \
-    --train-benchmarks gsm8k strategyqa --holdout-benchmark svamp --epochs 200
+    --train-benchmarks gsm8k strategyqa --target-benchmark svamp --epochs 200
 
 # Performance estimation with encoder
 python -m experiment.exp_performance_estimation \

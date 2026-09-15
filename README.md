@@ -14,7 +14,14 @@ Slash GenAI evaluation costs by up to 100x while actively discovering model fail
 
 ## Installation
 
-Install from source as a local Python package:
+The latest published release is available from PyPI:
+
+```bash
+pip install proeval
+```
+
+The published `0.1.0` release currently lags behind `main`. To use the latest
+source code, clone the repository and install it locally:
 
 ```bash
 git clone https://github.com/google-deepmind/proeval.git
@@ -32,27 +39,56 @@ pip install -e ".[all]"       # everything above
 pip install -e ".[dev]"       # pytest, ruff, build tooling
 ```
 
+The API examples below follow `main`; use the source install above if an API is
+not yet present in the published `0.1.0` release.
+
 ## Quick Start
 
+This offline example uses an in-memory prediction table, so it works without
+an API key or the repository's research data. Prediction columns must be named
+`label_<model>` and use `1 = failure`, `0 = correct`.
+
 ```python
-from proeval import BQPriorSampler, LLMPredictor, DATASET_CONFIGS
-from proeval.sampler import load_predictions, extract_model_predictions
-import numpy as np
+import pandas as pd
 
-# Estimate a model's error rate with ~1% of the data
-sampler = BQPriorSampler(noise_variance=0.3)
-result = sampler.sample(predictions="svamp", target_model="gemini25_flash", budget=50)
+from proeval import BQPriorSampler
 
-# Compare against the true error rate
-df = load_predictions("svamp")
-pred_matrix, model_names = extract_model_predictions(df)
-true_mean = np.mean(pred_matrix[:, model_names.index("gemini25_flash")])
+predictions = pd.DataFrame(
+    {
+        "label_reference_a": [0, 0, 1, 0, 1, 0],
+        "label_reference_b": [0, 1, 1, 0, 0, 0],
+        "label_candidate": [0, 0, 1, 0, 1, 1],
+    }
+)
+
+result = BQPriorSampler(noise_variance=0.3).sample(
+    predictions=predictions,
+    target_model="candidate",
+    budget=3,
+    pretrain_mode="all",  # Required for an unnamed in-memory DataFrame.
+    seed=42,
+)
 
 print(f"Estimated error rate: {result.estimates[-1]:.4f}")
-print(f"MAE: {result.mae(true_mean):.4f}")
+print(f"Selected rows: {result.selected_indices}")
 ```
 
-Run the bundled one-click example: `python experiment/sample_usage.py`
+See the [Python API guide](./proeval/README.md) for custom datasets, model
+evaluation, and test-case generation.
+
+## Reproducing the Paper Experiments
+
+The pre-computed prediction CSVs and embeddings under `data/` are research
+artifacts stored only in the GitHub repository. They are approximately 381 MB
+and are intentionally not included in the PyPI wheel or source distribution.
+Clone the repository before using dataset-name shortcuts such as
+`predictions="svamp"`, or pass your own DataFrame or explicit `data_dir`.
+
+From a source checkout, run the bundled example with:
+
+```bash
+python experiment/sample_usage.py
+```
 
 ## Experiments
 
