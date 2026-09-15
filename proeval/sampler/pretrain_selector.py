@@ -32,12 +32,10 @@ Example::
 """
 
 import os
-import warnings
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.exceptions import ConvergenceWarning
 from sklearn.mixture import GaussianMixture
 
 from proeval.sampler.data import _default_data_dir
@@ -91,7 +89,7 @@ def _load_benchmark_predictions(
         raise ValueError(f"No label_ columns found in {csv_path}")
 
     prediction_matrix = df[model_cols].values
-    model_names = [c[len("label_") :] for c in model_cols]
+    model_names = [c.replace("label_", "") for c in model_cols]
     return prediction_matrix, model_names
 
 
@@ -154,27 +152,24 @@ def _find_optimal_clusters(
 ) -> int:
     """Select optimal GMM cluster count using BIC."""
     n_samples = features.shape[0]
-    n_distinct = np.unique(features, axis=0).shape[0]
-    max_k = min(max_clusters, n_samples - 1, n_distinct)
+    max_k = min(max_clusters, n_samples - 1)
     if max_k < 2:
-        return 1
+        return 2
 
     bics: List[Tuple[int, float]] = []
     for k in range(2, max_k + 1):
         try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("error", category=ConvergenceWarning)
-                gmm = GaussianMixture(
-                    n_components=k, random_state=random_state,
-                    covariance_type="diag", reg_covar=1e-4,
-                )
-                gmm.fit(features)
+            gmm = GaussianMixture(
+                n_components=k, random_state=random_state,
+                covariance_type="diag", reg_covar=1e-4,
+            )
+            gmm.fit(features)
             bics.append((k, gmm.bic(features)))
         except Exception:  # noqa: BLE001
             continue
 
     if not bics:
-        return 1
+        return 2
     return min(bics, key=lambda x: x[1])[0]
 
 
@@ -296,7 +291,7 @@ def select_pretrain_models_gmm(
         raise FileNotFoundError(f"Target predictions not found: {target_csv}")
     target_df = pd.read_csv(target_csv, nrows=0)  # header only
     target_model_cols = [c for c in target_df.columns if c.startswith("label_")]
-    target_model_names = [c[len("label_") :] for c in target_model_cols]
+    target_model_names = [c.replace("label_", "") for c in target_model_cols]
 
     pretrain_indices: List[int] = []
     pretrain_names: List[str] = []

@@ -30,6 +30,11 @@ def _coerce_real_array(values, *, name: str) -> np.ndarray:
     unconverted = np.asarray(values)
     if np.iscomplexobj(unconverted) or unconverted.dtype.kind in {"M", "m"}:
         raise ValueError(f"{name} must contain only real numeric values")
+    if unconverted.dtype.kind == "O" and any(
+        isinstance(value, (complex, np.complexfloating, np.datetime64, np.timedelta64))
+        for value in unconverted.flat
+    ):
+        raise ValueError(f"{name} must contain only real numeric values")
     try:
         return np.asarray(values, dtype=float)
     except (OverflowError, TypeError, ValueError) as exc:
