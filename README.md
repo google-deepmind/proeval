@@ -2,8 +2,7 @@
 
 ![GitHub License](https://img.shields.io/github/license/google-deepmind/proeval)
 [![PyPI version](https://img.shields.io/pypi/v/proeval.svg?logo=pypi&logoColor=white)](https://pypi.org/project/proeval/)
-[![PyPI downloads](https://img.shields.io/pypi/dm/proeval.svg?logo=pypi&logoColor=white)](https://pypi.org/project/proeval/)
-[![Python versions](https://img.shields.io/pypi/pyversions/proeval.svg)](https://pypi.org/project/proeval/)
+[![PyPI downloads](https://img.shields.io/pepy/dt/proeval.svg?logo=pypi&logoColor=white)](https://pypi.org/project/proeval/)
 [![arXiv](https://img.shields.io/badge/arXiv-2604.23099-b31b1b.svg?style=flat&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2604.23099)
 [![Contact Us](https://img.shields.io/badge/Contact%20Us-proeval@google.com-4285F4?logo=gmail&logoColor=white)](mailto:proeval@google.com)
 
