@@ -199,7 +199,9 @@ def _variance_improvement(
         k_t_inv = np.eye(test_x.shape[0])
     A = test_x.T
     Q = test_x[:, unlabeled_indices].T
-    best_local_idx, k_t_inv = _find_best_i_and_update(A, k_t_inv, Q, noise_variance)
+    # The posterior precision is I + X X.T / noise_variance, so the
+    # rank-1 update must use noise precision rather than variance.
+    best_local_idx, k_t_inv = _find_best_i_and_update(A, k_t_inv, Q, 1 / noise_variance)
     return unlabeled_indices[best_local_idx], k_t_inv
 
 
