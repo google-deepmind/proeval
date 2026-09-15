@@ -14,45 +14,90 @@ Slash GenAI evaluation costs by up to 100x while actively discovering model fail
 
 ## Installation
 
-Install from source as a local Python package:
+### Published release
+
+Install ProEval from [PyPI](https://pypi.org/project/proeval/). The current
+`0.1.0` release requires Python 3.10 or newer:
+
+```bash
+python -m pip install --upgrade proeval
+python -m pip install --upgrade "proeval[topic]"  # Optional topic generation
+```
+
+The `0.1.0` package predates recent API and sampling improvements on `main`,
+installs PyTorch as a core dependency, and does not include the repository's
+research data.
+
+### Current `main`
+
+The current source supports Python 3.9 or newer and provides the APIs used by
+the examples below. Clone the repository for the latest library code or the
+research artifacts under `data/`:
 
 ```bash
 git clone https://github.com/google-deepmind/proeval.git
 cd proeval
-pip install -e .
+python -m pip install -e .
 ```
 
 Optional extras:
 
 ```bash
-pip install -e ".[encoder]"   # PyTorch — for BQEncoderSampler and encoder training
-pip install -e ".[topics]"    # BERTopic + HDBSCAN — for TopicAwareGenerator
-pip install -e ".[datasets]"  # HuggingFace datasets — for evaluator.load_dataset_data
-pip install -e ".[all]"       # everything above
-pip install -e ".[dev]"       # pytest, ruff, build tooling
+python -m pip install -e ".[encoder]"   # PyTorch — for BQEncoderSampler and encoder training
+python -m pip install -e ".[topics]"    # BERTopic + HDBSCAN — for TopicAwareGenerator
+python -m pip install -e ".[datasets]"  # HuggingFace datasets — for evaluator.load_dataset_data
+python -m pip install -e ".[all]"       # everything above
+python -m pip install -e ".[dev]"       # pytest, ruff, build tooling
 ```
 
 ## Quick Start
 
+This example targets the current `main` API. It uses an in-memory prediction
+table, so it works without an API key or the repository's research data.
+Prediction columns must be named `label_<model>` and use `1 = failure`,
+`0 = correct`.
+
 ```python
-from proeval import BQPriorSampler, LLMPredictor, DATASET_CONFIGS
-from proeval.sampler import load_predictions, extract_model_predictions
-import numpy as np
+import pandas as pd
 
-# Estimate a model's error rate with ~1% of the data
-sampler = BQPriorSampler(noise_variance=0.3)
-result = sampler.sample(predictions="svamp", target_model="gemini25_flash", budget=50)
+from proeval import BQPriorSampler
 
-# Compare against the true error rate
-df = load_predictions("svamp")
-pred_matrix, model_names = extract_model_predictions(df)
-true_mean = np.mean(pred_matrix[:, model_names.index("gemini25_flash")])
+predictions = pd.DataFrame(
+    {
+        "label_reference_a": [0, 0, 1, 0, 1, 0],
+        "label_reference_b": [0, 1, 1, 0, 0, 0],
+        "label_candidate": [0, 0, 1, 0, 1, 1],
+    }
+)
+
+result = BQPriorSampler(noise_variance=0.3).sample(
+    predictions=predictions,
+    target_model="candidate",
+    budget=3,
+    pretrain_mode="all",  # Required for an unnamed in-memory DataFrame.
+    seed=42,
+)
 
 print(f"Estimated error rate: {result.estimates[-1]:.4f}")
-print(f"MAE: {result.mae(true_mean):.4f}")
+print(f"Selected rows: {result.selected_indices}")
 ```
 
-Run the bundled one-click example: `python experiment/sample_usage.py`
+See the [Python API guide](./proeval/README.md) for custom datasets, model
+evaluation, and test-case generation.
+
+## Reproducing the Paper Experiments
+
+The pre-computed prediction CSVs and embeddings under `data/` are research
+artifacts stored only in the GitHub repository. They are approximately 381 MB
+and are intentionally not included in the PyPI wheel or source distribution.
+Clone the repository before using dataset-name shortcuts such as
+`predictions="svamp"`, or pass your own DataFrame or explicit `data_dir`.
+
+From a source checkout, run the bundled example with:
+
+```bash
+python experiment/sample_usage.py
+```
 
 ## Experiments
 
