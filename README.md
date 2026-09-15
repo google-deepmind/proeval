@@ -1,6 +1,8 @@
 # ProEval
 
 ![GitHub License](https://img.shields.io/github/license/google-deepmind/proeval)
+[![PyPI](https://img.shields.io/pypi/v/proeval.svg)](https://pypi.org/project/proeval/)
+[![Python versions](https://img.shields.io/pypi/pyversions/proeval.svg)](https://pypi.org/project/proeval/)
 [![arXiv](https://img.shields.io/badge/arXiv-2604.23099-b31b1b.svg?style=flat&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2604.23099)
 [![Contact Us](https://img.shields.io/badge/Contact%20Us-proeval@google.com-4285F4?logo=gmail&logoColor=white)](mailto:proeval@google.com)
 
@@ -14,39 +16,48 @@ Slash GenAI evaluation costs by up to 100x while actively discovering model fail
 
 ## Installation
 
-The latest published release is available from PyPI:
+### Published release
+
+Install ProEval from [PyPI](https://pypi.org/project/proeval/). The current
+`0.1.0` release requires Python 3.10 or newer:
 
 ```bash
-pip install proeval
+python -m pip install --upgrade proeval
+python -m pip install --upgrade "proeval[topic]"  # Optional topic generation
 ```
 
-The published `0.1.0` release currently lags behind `main`. To use the latest
-source code, clone the repository and install it locally:
+The `0.1.0` package predates recent API and sampling improvements on `main`,
+installs PyTorch as a core dependency, and does not include the repository's
+research data.
+
+### Current `main`
+
+The current source supports Python 3.9 or newer and provides the APIs used by
+the examples below. Clone the repository for the latest library code or the
+research artifacts under `data/`:
 
 ```bash
 git clone https://github.com/google-deepmind/proeval.git
 cd proeval
-pip install -e .
+python -m pip install -e .
 ```
 
 Optional extras:
 
 ```bash
-pip install -e ".[encoder]"   # PyTorch — for BQEncoderSampler and encoder training
-pip install -e ".[topics]"    # BERTopic + HDBSCAN — for TopicAwareGenerator
-pip install -e ".[datasets]"  # HuggingFace datasets — for evaluator.load_dataset_data
-pip install -e ".[all]"       # everything above
-pip install -e ".[dev]"       # pytest, ruff, build tooling
+python -m pip install -e ".[encoder]"   # PyTorch — for BQEncoderSampler and encoder training
+python -m pip install -e ".[topics]"    # BERTopic + HDBSCAN — for TopicAwareGenerator
+python -m pip install -e ".[datasets]"  # HuggingFace datasets — for evaluator.load_dataset_data
+python -m pip install -e ".[all]"       # everything above
+python -m pip install -e ".[dev]"       # pytest, ruff, build tooling
 ```
-
-The API examples below follow `main`; use the source install above if an API is
-not yet present in the published `0.1.0` release.
 
 ## Quick Start
 
-This offline example uses an in-memory prediction table, so it works without
-an API key or the repository's research data. Prediction columns must be named
-`label_<model>` and use `1 = failure`, `0 = correct`.
+This example targets the current `main` API. It uses an in-memory prediction
+table, so it works without an API key or the repository's research data.
+Prediction columns must be named `label_<model>` and use `1 = failure`,
+`0 = correct`.
 
 ```python
 import pandas as pd

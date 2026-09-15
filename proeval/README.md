@@ -1,31 +1,40 @@
 # ProEval — Active Evaluation with Bayesian Quadrature
 
-A Python library for efficient LLM evaluation through Bayesian Quadrature active sampling, topic-aware test case generation, structured LLM prediction, and neural encoder training.
+A Python library for efficient LLM evaluation through Bayesian Quadrature active sampling, topic-aware test case generation, structured LLM prediction, and neural encoder training. This guide documents the current `main` branch API.
 
 ## Installation
 
-Install the latest published release from PyPI:
+### Published release
+
+Install ProEval from [PyPI](https://pypi.org/project/proeval/). The current
+`0.1.0` release requires Python 3.10 or newer:
 
 ```bash
-pip install proeval
+python -m pip install --upgrade proeval
+python -m pip install --upgrade "proeval[topic]"  # Optional topic generation
 ```
 
-The published `0.1.0` release currently lags behind `main`. For the latest
-source code and the repository-only research data, clone the repository and
-install the extras you need:
+The `0.1.0` package predates recent APIs documented in this guide, installs
+PyTorch as a core dependency, and does not include the repository's research
+data.
+
+### Current `main`
+
+The current source supports Python 3.9 or newer. For the latest API and the
+repository-only research data, clone the repository and install the extras you
+need:
 
 ```bash
 git clone https://github.com/google-deepmind/proeval.git
 cd proeval
-pip install -e .
-pip install -e ".[encoder]"  # BQEncoderSampler and encoder training
-pip install -e ".[topics]"   # TopicAwareGenerator
+python -m pip install -e .
+python -m pip install -e ".[encoder]"  # BQEncoderSampler and encoder training
+python -m pip install -e ".[topics]"   # TopicAwareGenerator
 ```
 
 The prediction CSVs and embeddings under `data/` are not included in PyPI
 distributions. Dataset-name shortcuts therefore require a source checkout or an
 explicit `data_dir`; installed-package users can always pass a DataFrame.
-The API examples below follow `main`.
 
 ## Quick Start
 
