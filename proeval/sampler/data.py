@@ -25,6 +25,17 @@ import numpy as np
 import pandas as pd
 
 
+def _coerce_real_array(values, *, name: str) -> np.ndarray:
+    """Convert numeric input to float without silently discarding imaginary parts."""
+    unconverted = np.asarray(values)
+    if np.iscomplexobj(unconverted) or unconverted.dtype.kind in {"M", "m"}:
+        raise ValueError(f"{name} must contain only real numeric values")
+    try:
+        return np.asarray(values, dtype=float)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must contain only numeric values") from exc
+
+
 def _prepare_score_features(
     source_scores: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -107,15 +118,16 @@ def load_embeddings(
 def extract_model_predictions(
     df: pd.DataFrame, dataset_name: str = None
 ) -> Tuple[np.ndarray, List[str]]:
-    """Extract a binary prediction matrix from a predictions DataFrame.
+    """Extract a real-valued score matrix from a predictions DataFrame.
 
-    Labels use the convention: **1=error, 0=correct** (measuring failure rate).
+    Binary labels conventionally use **1=error, 0=correct**. General finite
+    real-valued scores are also supported, as in the paper's score function.
 
     For DICES/DICES-T2I datasets, continuous error scores are binarised at
     0.5: scores greater than or equal to 0.5 are failures. This matches the
     evaluation convention used elsewhere in ProEval.
-    For other datasets, ``label_`` columns are already error indicators
-    and are used directly.
+    For other datasets, ``label_`` columns are used directly and must contain
+    finite real scores.
 
     Args:
         df: Predictions DataFrame with ``label_<model>`` columns.
@@ -123,15 +135,36 @@ def extract_model_predictions(
 
     Returns:
         ``(prediction_matrix, model_names)`` where ``prediction_matrix`` has
-        shape ``(n_samples, n_models)`` with values in {0, 1}
-        (1=error, 0=correct).
+        shape ``(n_samples, n_models)``. Non-DICES scores retain their scale.
     """
-    model_columns = [col for col in df.columns if col.startswith("label_")]
-    model_names = [col.replace("label_", "") for col in model_columns]
+    model_columns = [
+        column
+        for column in df.columns
+        if isinstance(column, str) and column.startswith("label_")
+    ]
+    if not model_columns:
+        raise ValueError(
+            "predictions must contain at least one column named 'label_<model>'"
+        )
+    model_names = [column[len("label_") :] for column in model_columns]
+    if any(not name for name in model_names):
+        raise ValueError("prediction label columns must include a model name")
+    if len(set(model_columns)) != len(model_columns):
+        raise ValueError("prediction label column names must be unique")
+    if len(set(model_names)) != len(model_names):
+        raise ValueError("prediction label model names must be unique")
+
+    numeric_labels = _coerce_real_array(
+        df[model_columns].to_numpy(), name="prediction labels"
+    )
+    if numeric_labels.shape[0] == 0:
+        raise ValueError("predictions must contain at least one item")
+    if not np.all(np.isfinite(numeric_labels)):
+        raise ValueError("prediction labels must contain only finite values")
 
     model_data = {}
-    for model_name in model_names:
-        y_labels = df[f"label_{model_name}"].values
+    for model_index, model_name in enumerate(model_names):
+        y_labels = numeric_labels[:, model_index]
         # Use raw labels: 1=error, 0=correct.
         # For DICES/DICES_T2I, continuous error scores at or above 0.5 count
         # as failures, matching the failure-discovery threshold.

@@ -67,7 +67,7 @@ def load_benchmark_data(
 
     # Extract model names and scores
     model_columns = [col for col in df.columns if col.startswith("label_")]
-    model_names = [col.replace("label_", "") for col in model_columns]
+    model_names = [col[len("label_") :] for col in model_columns]
 
     labels = []
     for name in model_names:
@@ -279,4 +279,3 @@ def prepare_holdout_split(
         target_model=target_model,
         include_target_benchmark_in_training=True,
     )
-
