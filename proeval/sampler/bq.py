@@ -228,6 +228,18 @@ def _variance_improvement_gp(
 
 
 # Core BQ sampling loop
+
+
+def _validate_active_sampling_budget(
+    n_init: int, budget: int, n_samples: int
+) -> None:
+    """Validate active-sampling budget bounds before sampling."""
+    if not 0 <= n_init <= budget <= n_samples:
+        raise ValueError(
+            "expected 0 <= n_init <= budget <= n_samples; "
+            f"got n_init={n_init}, budget={budget}, n_samples={n_samples}"
+        )
+
 def _bq_active_sampling(
     test_x: np.ndarray,
     test_y: np.ndarray,
@@ -243,6 +255,7 @@ def _bq_active_sampling(
     step, the acquisition-order indices, and the final posterior.
     """
     n_samples = test_x.shape[1]
+    _validate_active_sampling_budget(n_init, budget, n_samples)
 
     # Optional random initialisation from "interesting" prior range
     good_indices = [i for i in range(len(u)) if 0.2 < u[i] < 0.6]
@@ -260,36 +273,42 @@ def _bq_active_sampling(
     
     true_prior_integral_var = np.sum(S) / (n_samples * n_samples)
     integral_variance = np.ones(budget) * true_prior_integral_var
-    k_t_inv = None
     mu_x = np.mean(test_x, axis=1, keepdims=True)
 
+    # Keep the rank-1 acquisition state aligned with any random initial points.
+    if labeled_indices:
+        train_x_init = test_x[:, labeled_indices]
+        k_t_inv = np.linalg.inv(
+            np.dot(train_x_init, train_x_init.T) / noise_variance
+            + np.eye(test_x.shape[0])
+        )
+    else:
+        k_t_inv = None
+
     for t in range(n_init, budget):
+        # Acquire first so estimates[t] represents the posterior after t + 1
+        # actual target evaluations. The zero-sample state remains available
+        # separately through result.prior_mean.
+        train_x_t = test_x[:, labeled_indices]
+        best_idx, k_t_inv = _variance_improvement(
+            train_x_t, k_t_inv, noise_variance, unlabeled_indices, test_x
+        )
+        labeled_indices.append(best_idx)
+        unlabeled_indices.remove(best_idx)
+
         train_x_t = test_x[:, labeled_indices]
         train_y_t = test_y[labeled_indices]
-
-        if t == 0:
-            u_t = u
-            int_var_t = true_prior_integral_var
-        else:
-            u_t, s_t = _get_posterior(
-                train_x_t, train_y_t, test_x, noise_variance, labeled_indices, u
-            )
-            _, s_mu = _get_posterior(
-                train_x_t, train_y_t, mu_x, noise_variance, labeled_indices, u
-            )
-            int_var_t = s_mu[0]
+        u_t, _ = _get_posterior(
+            train_x_t, train_y_t, test_x, noise_variance, labeled_indices, u
+        )
+        _, s_mu = _get_posterior(
+            train_x_t, train_y_t, mu_x, noise_variance, labeled_indices, u
+        )
 
         rounded_estimates[t] = np.mean(np.round(u_t))
         estimates[t] = np.mean(u_t)
         # Integral variance is variance of the mean
-        integral_variance[t] = np.maximum(int_var_t, 0.0)
-
-        if t < budget - 1:
-            best_idx, k_t_inv = _variance_improvement(
-                train_x_t, k_t_inv, noise_variance, unlabeled_indices, test_x
-            )
-            labeled_indices.append(best_idx)
-            unlabeled_indices.remove(best_idx)
+        integral_variance[t] = np.maximum(s_mu[0], 0.0)
 
     # Back-fill initial steps
     for t in range(n_init):
@@ -527,6 +546,7 @@ def _bq_matern_active_sampling(
     # Normalize embeddings
     emb_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-10)
     n_samples = emb_norm.shape[0]
+    _validate_active_sampling_budget(n_init, budget, n_samples)
 
     # Optional random initialisation
     good_indices = [i for i in range(n_samples) if 0.2 < u[i] < 0.6]
@@ -543,29 +563,34 @@ def _bq_matern_active_sampling(
     rounded_estimates = np.ones(budget) * np.mean(np.round(np.clip(u, 0, 1)))
     integral_variance = np.ones(budget) * 1.0
 
-    for t in range(n_init, budget):
-        if t == 0:
-            u_t = u.copy()
-            posterior_cov = _compute_matern_kernel_np(emb_norm, lengthscale=lengthscale, nu=nu)
-        else:
-            u_t, posterior_cov = _get_posterior_matern(
-                emb_norm[labeled_indices], test_y[labeled_indices],
-                emb_norm, noise_variance, labeled_indices, u,
-                lengthscale=lengthscale, nu=nu, full_cov=True,
-            )
+    if labeled_indices:
+        _, posterior_cov = _get_posterior_matern(
+            emb_norm[labeled_indices], test_y[labeled_indices],
+            emb_norm, noise_variance, labeled_indices, u,
+            lengthscale=lengthscale, nu=nu, full_cov=True,
+        )
+    else:
+        posterior_cov = _compute_matern_kernel_np(
+            emb_norm, lengthscale=lengthscale, nu=nu
+        )
 
+    for t in range(n_init, budget):
+        best_idx = _variance_improvement_gp(
+            posterior_cov, unlabeled_indices, noise_variance,
+        )
+        labeled_indices.append(best_idx)
+        unlabeled_indices.remove(best_idx)
+
+        u_t, posterior_cov = _get_posterior_matern(
+            emb_norm[labeled_indices], test_y[labeled_indices],
+            emb_norm, noise_variance, labeled_indices, u,
+            lengthscale=lengthscale, nu=nu, full_cov=True,
+        )
         estimates[t] = np.mean(u_t)
         rounded_estimates[t] = np.mean(np.round(np.clip(u_t, 0, 1)))
         integral_variance[t] = np.maximum(
             np.sum(posterior_cov) / (n_samples * n_samples), 0.0
         )
-
-        if t < budget - 1:
-            best_idx = _variance_improvement_gp(
-                posterior_cov, unlabeled_indices, noise_variance,
-            )
-            labeled_indices.append(best_idx)
-            unlabeled_indices.remove(best_idx)
 
     # Back-fill init steps
     for t in range(n_init):
@@ -827,6 +852,7 @@ def _bq_encoder_sampling(
 
     kernel_type = getattr(encoder, "kernel_type", "linear")
     n_samples = phi_embeddings.shape[0]
+    _validate_active_sampling_budget(n_init, budget, n_samples)
 
     # Optional random initialisation from "interesting" prior range
     good_indices = [i for i in range(n_samples) if 0.2 < u[i] < 0.6]
@@ -848,35 +874,41 @@ def _bq_encoder_sampling(
     use_gp_path = (kernel_type != "linear")
 
     if use_gp_path:
-        # Matérn / RBF path: maintain full posterior covariance
-        for t in range(n_init, budget):
-            if t == 0:
-                u_t = u.copy()
-                # Prior covariance from encoder kernel
-                phi_t = torch.from_numpy(phi_embeddings).float().to(device)
-                posterior_cov = compute_kernel_matrix(
-                    phi_t, encoder
-                ).detach().cpu().numpy()
-            else:
-                phi_train = phi_embeddings[labeled_indices]
-                u_t, posterior_cov = get_posterior_embedding(
-                    phi_train, test_y[labeled_indices],
-                    phi_embeddings, noise_variance,
-                    labeled_indices, u, encoder, device,
-                    full_cov=True,
-                )
+        # Matérn / RBF path: maintain full posterior covariance.
+        if labeled_indices:
+            phi_train = phi_embeddings[labeled_indices]
+            _, posterior_cov = get_posterior_embedding(
+                phi_train, test_y[labeled_indices],
+                phi_embeddings, noise_variance,
+                labeled_indices, u, encoder, device,
+                full_cov=True,
+            )
+        else:
+            phi_t = torch.from_numpy(phi_embeddings).float().to(device)
+            posterior_cov = compute_kernel_matrix(
+                phi_t, encoder
+            ).detach().cpu().numpy()
 
+        for t in range(n_init, budget):
+            best_idx = _variance_improvement_gp(
+                posterior_cov, unlabeled_indices, noise_variance,
+            )
+            labeled_indices.append(best_idx)
+            unlabeled_indices.remove(best_idx)
+
+            phi_train = phi_embeddings[labeled_indices]
+            u_t, posterior_cov = get_posterior_embedding(
+                phi_train, test_y[labeled_indices],
+                phi_embeddings, noise_variance,
+                labeled_indices, u, encoder, device,
+                full_cov=True,
+            )
             estimates[t] = np.mean(u_t)
             rounded_estimates[t] = np.mean(np.round(np.clip(u_t, 0, 1)))
             # Integral variance from full posterior covariance
-            integral_variance[t] = np.maximum(np.sum(posterior_cov) / (n_samples * n_samples), 0.0)
-
-            if t < budget - 1:
-                best_idx = _variance_improvement_gp(
-                    posterior_cov, unlabeled_indices, noise_variance,
-                )
-                labeled_indices.append(best_idx)
-                unlabeled_indices.remove(best_idx)
+            integral_variance[t] = np.maximum(
+                np.sum(posterior_cov) / (n_samples * n_samples), 0.0
+            )
 
         # Back-fill initial steps
         for t in range(n_init):
@@ -905,41 +937,40 @@ def _bq_encoder_sampling(
     else:
         # Linear kernel path: use fast rank-1 update
         test_x = phi_embeddings.T  # (d, m)
-        k_t_inv = None
         mu_x = np.mean(test_x, axis=1, keepdims=True)
 
-        # compute prior mean_var properly
-        prior_cov_sum = np.dot(np.dot(mu_x.T, np.eye(test_x.shape[0])), mu_x)[0, 0]
+        if labeled_indices:
+            train_x_init = test_x[:, labeled_indices]
+            k_t_inv = np.linalg.inv(
+                np.dot(train_x_init, train_x_init.T) / noise_variance
+                + np.eye(test_x.shape[0])
+            )
+        else:
+            k_t_inv = None
 
         for t in range(n_init, budget):
             train_x = test_x[:, labeled_indices] if labeled_indices else test_x[:, []]
-            train_y_arr = test_y[labeled_indices] if labeled_indices else np.array([])
+            best_idx, k_t_inv = _variance_improvement(
+                train_x, k_t_inv, noise_variance,
+                unlabeled_indices, test_x,
+            )
+            labeled_indices.append(best_idx)
+            unlabeled_indices.remove(best_idx)
 
-            if t == 0:
-                u_t = u.copy()
-                int_var_t = prior_cov_sum  # prior variance
-            else:
-                u_t, s_t = _get_posterior(
-                    train_x, train_y_arr, test_x,
-                    noise_variance, labeled_indices, u,
-                )
-                _, s_mu = _get_posterior(
-                    train_x, train_y_arr, mu_x,
-                    noise_variance, labeled_indices, u,
-                )
-                int_var_t = s_mu[0]
+            train_x = test_x[:, labeled_indices]
+            train_y_arr = test_y[labeled_indices]
+            u_t, _ = _get_posterior(
+                train_x, train_y_arr, test_x,
+                noise_variance, labeled_indices, u,
+            )
+            _, s_mu = _get_posterior(
+                train_x, train_y_arr, mu_x,
+                noise_variance, labeled_indices, u,
+            )
 
             estimates[t] = np.mean(u_t)
             rounded_estimates[t] = np.mean(np.round(np.clip(u_t, 0, 1)))
-            integral_variance[t] = np.maximum(int_var_t, 0.0)
-
-            if t < budget - 1:
-                best_idx, k_t_inv = _variance_improvement(
-                    train_x, k_t_inv, noise_variance,
-                    unlabeled_indices, test_x,
-                )
-                labeled_indices.append(best_idx)
-                unlabeled_indices.remove(best_idx)
+            integral_variance[t] = np.maximum(s_mu[0], 0.0)
 
         # Back-fill initial steps
         for t in range(n_init):
