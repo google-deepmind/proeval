@@ -866,6 +866,22 @@ def _bq_matern_random_sampling(
 # Public API
 
 
+def _contains_missing_id_component(item_id: Any) -> bool:
+    """Return whether an item ID, including a tuple ID, contains a missing value."""
+    if item_id is None:
+        return True
+    if isinstance(item_id, tuple):
+        return any(_contains_missing_id_component(component) for component in item_id)
+
+    try:
+        missing = pd.isna(item_id)
+        if isinstance(missing, (bool, np.bool_)):
+            return bool(missing)
+        return bool(np.asarray(missing, dtype=bool).any())
+    except (TypeError, ValueError):
+        return False
+
+
 def _validate_plan_inputs(
     source_scores: Union[np.ndarray, pd.DataFrame],
     item_ids: Optional[Sequence[Any]],
@@ -910,13 +926,7 @@ def _validate_plan_inputs(
         )
 
     for item_id in normalized_ids:
-        if item_id is None:
-            raise ValueError("item_ids must not contain missing values")
-        try:
-            missing = pd.isna(item_id)
-        except (TypeError, ValueError):
-            missing = False
-        if isinstance(missing, (bool, np.bool_)) and missing:
+        if _contains_missing_id_component(item_id):
             raise ValueError("item_ids must not contain missing values")
 
     try:

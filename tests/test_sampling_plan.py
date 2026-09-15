@@ -140,6 +140,7 @@ def test_plan_validates_source_scores(source_scores, message):
         ([[], []], "hashable"),
         ([None, "b"], "missing"),
         ([np.nan, "b"], "missing"),
+        ([(np.nan, "a"), ("b", "c")], "missing"),
     ],
 )
 def test_plan_validates_item_ids(item_ids, message):
