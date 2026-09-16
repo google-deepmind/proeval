@@ -121,7 +121,7 @@ def extract_model_predictions(df: pd.DataFrame, dataset_name: str = None) -> Tup
     or above 0.5 are failures, consistent with the rest of ProEval.
     """
     model_columns = [col for col in df.columns if col.startswith('label_')]
-    model_names = [col.replace('label_', '') for col in model_columns]
+    model_names = [col[len('label_'):] for col in model_columns]
     
     model_data = {}
     for model_name in model_names:
@@ -1059,4 +1059,3 @@ def run_rf_lure_evaluation(y_true: np.ndarray, embeddings: np.ndarray,
     surrogate_config = SurrogateConfig(use_rf=True)
     return run_incremental_lure_evaluation(y_true, embeddings, steps, seed_size,
                                            surrogate_config=surrogate_config)
-

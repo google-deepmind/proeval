@@ -56,13 +56,14 @@ Example::
 """
 
 from dataclasses import dataclass, field
-from numbers import Integral
+from numbers import Integral, Real
 from typing import Any, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
 from proeval.sampler.data import (
+    _coerce_real_array,
     _prepare_score_features,
     extract_model_predictions,
     load_predictions,
@@ -88,7 +89,74 @@ def _resolve_predictions(
         return predictions.predictions(data_dir=data_dir), predictions.name
     if isinstance(predictions, str):
         return load_predictions(predictions, data_dir=data_dir), predictions
-    return predictions, None
+    if isinstance(predictions, pd.DataFrame):
+        return predictions, None
+    raise ValueError(
+        "predictions must be a dataset name, pandas DataFrame, or Dataset"
+    )
+
+
+def _validate_noise_variance(noise_variance: float) -> float:
+    """Return a normalized positive finite observation-noise variance."""
+    if isinstance(noise_variance, bool) or not isinstance(noise_variance, Real):
+        raise ValueError(
+            "noise_variance must be a positive finite real number; "
+            f"got {noise_variance!r}"
+        )
+    try:
+        normalized = float(noise_variance)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "noise_variance must be a positive finite real number; "
+            f"got {noise_variance!r}"
+        ) from exc
+    if (
+        not np.isfinite(normalized)
+        or normalized <= 0
+        or normalized <= 1.0 / np.finfo(float).max
+    ):
+        raise ValueError(
+            "noise_variance must be a positive finite real number with a "
+            f"finite reciprocal; got {noise_variance!r}"
+        )
+    return normalized
+
+
+def _validate_pretrain_indices(
+    pretrain_indices: Sequence[int],
+    *,
+    n_models: int,
+    target_index: int,
+) -> List[int]:
+    """Validate and normalize source-model indices for prior construction."""
+    if isinstance(pretrain_indices, (str, bytes)):
+        raise ValueError("pretrain_indices must be a sequence of model indices")
+    try:
+        normalized = list(pretrain_indices)
+    except TypeError as exc:
+        raise ValueError(
+            "pretrain_indices must be a sequence of model indices"
+        ) from exc
+
+    if len(normalized) < 2:
+        raise ValueError("at least two pretrain source models are required")
+    if any(
+        isinstance(index, bool) or not isinstance(index, Integral)
+        for index in normalized
+    ):
+        raise ValueError("pretrain_indices must contain only integers")
+
+    normalized = [int(index) for index in normalized]
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("pretrain_indices must be unique")
+    invalid = [index for index in normalized if not 0 <= index < n_models]
+    if invalid:
+        raise ValueError(
+            f"pretrain_indices must be between 0 and {n_models - 1}; got {invalid}"
+        )
+    if target_index in normalized:
+        raise ValueError("pretrain_indices must not include the target model")
+    return normalized
 
 
 # Result container
@@ -104,8 +172,8 @@ class SamplingResult:
         posterior_var: Final posterior variance ``(n_samples,)``.
         prior_mean: Prior mean used ``(n_samples,)``.
         integral_variance: BQ integral posterior variance at each step ``(budget,)``.
-            This is the variance of the mean estimate, computed as
-            ``mean(posterior_diagonal_variance)``.
+            This is the posterior variance of the dataset mean under the
+            linear-kernel feature representation.
     """
 
     estimates: np.ndarray
@@ -200,10 +268,7 @@ class SamplingPlan:
         else:
             ordered_scores = scores
 
-        try:
-            score_array = np.asarray(ordered_scores, dtype=float)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("scores must be numeric") from exc
+        score_array = _coerce_real_array(ordered_scores, name="scores")
         if score_array.ndim != 1 or len(score_array) != len(self.indices):
             raise ValueError(
                 "scores must be one-dimensional with one value per selected item; "
@@ -481,12 +546,15 @@ def _bq_active_sampling(
     budget: int,
     n_init: int = 0,
     noise_variance: float = 0.3,
+    rng=None,
 ) -> SamplingResult:
     """Run the core BQ active sampling loop.
 
     Returns a :class:`SamplingResult` with posterior-mean estimates at each
     step, the acquisition-order indices, and the final posterior.
     """
+    if rng is None:
+        rng = np.random
     plan = _make_sampling_plan(
         test_x,
         u,
@@ -495,7 +563,7 @@ def _bq_active_sampling(
         n_init=n_init,
         noise_variance=noise_variance,
         item_ids=list(range(test_x.shape[1])),
-        rng=np.random,
+        rng=rng,
     )
     return _estimate_active_sampling(
         test_x,
@@ -887,12 +955,11 @@ def _validate_plan_inputs(
     item_ids: Optional[Sequence[Any]],
 ) -> Tuple[np.ndarray, List[Any]]:
     """Validate and normalize source scores and row IDs for planning."""
-    try:
-        # Match the row-major matrix produced by ``extract_model_predictions``.
-        # Stable memory layout also avoids tie-breaking drift in linear algebra.
-        score_array = np.ascontiguousarray(source_scores, dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("source_scores must contain only numeric values") from exc
+    # Match the row-major matrix produced by ``extract_model_predictions``.
+    # Stable memory layout also avoids tie-breaking drift in linear algebra.
+    score_array = np.ascontiguousarray(
+        _coerce_real_array(source_scores, name="source_scores")
+    )
     if score_array.ndim != 2:
         raise ValueError(
             "source_scores must be a two-dimensional array with shape "
@@ -943,11 +1010,13 @@ class BQPriorSampler:
     """Bayesian Quadrature active sampler with learned prior.
 
     Uses other models' predictions as features for a GP with a linear
-    kernel to efficiently estimate a target model's accuracy.
+    kernel to efficiently estimate a target model's mean error score.
 
     Args:
-        noise_variance: GP observation noise variance.
-        n_init: Number of random initial samples before active acquisition.
+        noise_variance: Positive, finite GP observation noise variance with a
+            finite floating-point reciprocal.
+        n_init: Non-negative number of random initial samples before active
+            acquisition.
 
     Example::
 
@@ -960,8 +1029,16 @@ class BQPriorSampler:
         noise_variance: float = 0.3,
         n_init: int = 0,
     ):
-        self.noise_variance = noise_variance
-        self.n_init = n_init
+        self.noise_variance = _validate_noise_variance(noise_variance)
+        if isinstance(n_init, bool) or not isinstance(n_init, Integral):
+            raise ValueError(
+                f"n_init and budget must be integers; got n_init={n_init!r}"
+            )
+        if n_init < 0:
+            raise ValueError(
+                f"n_init must be a non-negative integer; got {n_init!r}"
+            )
+        self.n_init = int(n_init)
 
     def plan(
         self,
@@ -1011,7 +1088,7 @@ class BQPriorSampler:
         target_model: Union[int, str] = "gemini25_flash",
         budget: int = 50,
         data_dir: str = None,
-        pretrain_indices: Optional[List[int]] = None,
+        pretrain_indices: Optional[Sequence[int]] = None,
         pretrain_mode: str = "gmm",
         reference_benchmarks: Optional[List[str]] = None,
         seed: Optional[int] = None,
@@ -1029,9 +1106,10 @@ class BQPriorSampler:
             pretrain_indices: Optional explicit list of model indices to use as
                 pre-training features.  If ``None``, behaviour depends on
                 *pretrain_mode*.
-            pretrain_mode: ``"all"`` (default) uses every model except the target.
-                ``"gmm"`` auto-selects models via GMM clustering on reference
-                benchmarks.  Ignored when *pretrain_indices* is provided.
+            pretrain_mode: ``"gmm"`` (default) auto-selects models via GMM
+                clustering on reference benchmarks. ``"all"`` uses every
+                model except the target. Ignored when *pretrain_indices* is
+                provided.
             reference_benchmarks: Benchmarks for GMM clustering.  Only used
                 when ``pretrain_mode="gmm"``.  ``None`` → auto-selected by
                 benchmark category.
@@ -1040,13 +1118,28 @@ class BQPriorSampler:
         Returns:
             :class:`SamplingResult` with estimates, selected indices, and posterior.
         """
-        if seed is not None:
-            np.random.seed(seed)
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, Integral)
+            or budget < 1
+        ):
+            raise ValueError(f"budget must be a positive integer; got {budget!r}")
+        if pretrain_indices is None and (
+            not isinstance(pretrain_mode, str)
+            or pretrain_mode not in {"gmm", "all"}
+        ):
+            raise ValueError(
+                "pretrain_mode must be 'gmm' or 'all'; "
+                f"got {pretrain_mode!r}"
+            )
+        use_all_sources = pretrain_indices is None and pretrain_mode == "all"
 
         # Load data (accepts a dataset name, a DataFrame, or a Dataset)
         df, dataset_name = _resolve_predictions(predictions, data_dir)
 
         pred_matrix, model_names = extract_model_predictions(df, dataset_name)
+        n_samples, n_models = pred_matrix.shape
+        _validate_active_sampling_budget(self.n_init, budget, n_samples)
 
         # Resolve target model
         if isinstance(target_model, str):
@@ -1056,7 +1149,17 @@ class BQPriorSampler:
                 )
             target_idx = model_names.index(target_model)
         else:
+            if isinstance(target_model, bool) or not isinstance(target_model, Integral):
+                raise ValueError(
+                    "target_model must be a model name or integer index; "
+                    f"got {target_model!r}"
+                )
             target_idx = int(target_model)
+            if not 0 <= target_idx < n_models:
+                raise ValueError(
+                    f"target_model index must be between 0 and {n_models - 1}; "
+                    f"got {target_idx}"
+                )
 
         # Auto-select pretrain indices via GMM if requested
         if pretrain_indices is None and pretrain_mode == "gmm":
@@ -1079,15 +1182,29 @@ class BQPriorSampler:
                 reference_benchmarks=reference_benchmarks,
             )
 
-        _, test_x, test_y, u, S = setup_train_test_split(
-            pred_matrix, target_idx, pretrain_indices
+        if pretrain_indices is None:
+            pretrain_indices = [
+                index for index in range(n_models) if index != target_idx
+            ]
+        pretrain_indices = _validate_pretrain_indices(
+            pretrain_indices,
+            n_models=n_models,
+            target_index=target_idx,
         )
 
+        _, test_x, test_y, u, S = setup_train_test_split(
+            pred_matrix,
+            target_idx,
+            None if use_all_sources else pretrain_indices,
+        )
+
+        rng = np.random if seed is None else np.random.RandomState(seed)
         return _bq_active_sampling(
             test_x, test_y, u, S,
             budget=budget,
             n_init=self.n_init,
             noise_variance=self.noise_variance,
+            rng=rng,
         )
 
     # Expose internal helpers for advanced users
