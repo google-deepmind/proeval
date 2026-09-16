@@ -39,6 +39,7 @@ research artifacts under `data/`:
 ```bash
 git clone https://github.com/google-deepmind/proeval.git
 cd proeval
+python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
