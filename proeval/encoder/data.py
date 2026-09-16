@@ -194,7 +194,7 @@ def split_train_and_target(
     """
     # Start with all benchmarks except target benchmark
     train_data = {
-        k: v for k, v in benchmark_data.items() if k != target_benchmark
+        k: dict(v) for k, v in benchmark_data.items() if k != target_benchmark
     }
 
     # New Model setting: Exclude target model from ALL other benchmarks as well!
@@ -277,5 +277,5 @@ def prepare_holdout_split(
         benchmark_data,
         target_benchmark=holdout_benchmark,
         target_model=target_model,
-        include_target_benchmark_in_training=True,
+        setting="new_pair",
     )
