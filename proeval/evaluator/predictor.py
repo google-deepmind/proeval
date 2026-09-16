@@ -197,10 +197,10 @@ def create_gsm8k_config() -> DatasetConfig:
             return 0.0 if str(pred).strip() == str(gt).strip() else 1.0
 
     def _gt(ans):
-        m = re.search(r"####\s*([0-9,]+(?:\.[0-9]+)?)", str(ans))
+        m = re.search(r"####\s*([+-]?[0-9,]+(?:\.[0-9]+)?)", str(ans))
         if m:
             return m.group(1).replace(",", "")
-        m = re.search(r"([0-9,]+(?:\.[0-9]+)?)", str(ans))
+        m = re.search(r"([+-]?[0-9,]+(?:\.[0-9]+)?)", str(ans))
         return m.group(1).replace(",", "") if m else str(ans).strip()
 
     return DatasetConfig(
