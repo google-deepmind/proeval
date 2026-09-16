@@ -32,10 +32,13 @@ Example::
 """
 
 import os
+import warnings
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.decomposition import PCA
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.mixture import GaussianMixture
 
 from proeval.sampler.data import _default_data_dir
@@ -73,7 +76,7 @@ def get_reference_benchmarks(
 def _load_benchmark_predictions(
     benchmark: str, data_dir: str
 ) -> Tuple[np.ndarray, List[str]]:
-    """Load binary predictions for all models on a single benchmark.
+    """Load finite real scores for all models on a single benchmark.
 
     Returns:
         ``(prediction_matrix, model_names)`` where ``prediction_matrix`` has
@@ -88,8 +91,15 @@ def _load_benchmark_predictions(
     if not model_cols:
         raise ValueError(f"No label_ columns found in {csv_path}")
 
-    prediction_matrix = df[model_cols].values
-    model_names = [c.replace("label_", "") for c in model_cols]
+    try:
+        prediction_matrix = df[model_cols].to_numpy(dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Prediction scores must be numeric in {csv_path}") from exc
+    if not prediction_matrix.shape[0] or not np.isfinite(prediction_matrix).all():
+        raise ValueError(f"Prediction scores must be nonempty and finite in {csv_path}")
+    if benchmark in ("dices", "dices_t2i"):
+        prediction_matrix = (prediction_matrix >= 0.5).astype(float)
+    model_names = [c[len("label_") :] for c in model_cols]
     return prediction_matrix, model_names
 
 
@@ -98,14 +108,14 @@ def _build_features(
 ) -> Tuple[np.ndarray, List[str]]:
     """Build per-model feature vectors from reference benchmark predictions.
 
-    For each model, the feature vector is ``[mean_acc_b1, std_b1, mean_acc_b2,
-    std_b2, ...]`` across the reference benchmarks.  Models absent from a
-    benchmark get that benchmark's features imputed with column means so that
-    we retain as many models as possible.
+    Concatenate each model's per-question scores across reference benchmarks,
+    then retain 95% of their variance using PCA. Models absent from a benchmark
+    get each missing score imputed with that question's mean across available
+    models. An explicitly present score column must contain finite values.
 
     Returns:
         ``(features, model_names)`` where ``features`` has shape
-        ``(n_models, 2 * n_benchmarks)``.
+        ``(n_models, n_pca_components)``.
     """
     benchmark_data: Dict[str, Dict] = {}
     all_models: set = set()
@@ -123,25 +133,30 @@ def _build_features(
 
     # Build feature matrix with NaN for missing entries
     n_models = len(all_models_sorted)
-    n_features = 2 * len(reference_benchmarks)
+    n_features = sum(data["predictions"].shape[0] for data in benchmark_data.values())
     features = np.full((n_models, n_features), np.nan)
-
-    for b_idx, bench in enumerate(reference_benchmarks):
+    model_indices = {model: index for index, model in enumerate(all_models_sorted)}
+    offset = 0
+    for bench in reference_benchmarks:
         data = benchmark_data[bench]
-        for model in data["models"]:
-            m_idx = all_models_sorted.index(model)
-            pred_idx = data["models"].index(model)
-            preds = data["predictions"][:, pred_idx]
-            features[m_idx, 2 * b_idx] = float(np.mean(preds))
-            features[m_idx, 2 * b_idx + 1] = float(np.std(preds))
+        n_questions = data["predictions"].shape[0]
+        for pred_idx, model in enumerate(data["models"]):
+            features[model_indices[model], offset : offset + n_questions] = (
+                data["predictions"][:, pred_idx]
+            )
+        offset += n_questions
 
     # Impute NaN with column means
     col_means = np.nanmean(features, axis=0)
-    for col in range(n_features):
-        mask = np.isnan(features[:, col])
-        features[mask, col] = col_means[col]
+    features = np.where(np.isnan(features), col_means, features)
 
-    return features, all_models_sorted
+    # PCA cannot report explained-variance ratios for identical behaviors.
+    if np.all(features == features[0]):
+        return np.zeros((n_models, 1)), all_models_sorted
+
+    pca = PCA(n_components=0.95, svd_solver="full")
+    pca.fit(features)
+    return pca.transform(features), all_models_sorted
 
 
 # GMM clustering
@@ -152,24 +167,27 @@ def _find_optimal_clusters(
 ) -> int:
     """Select optimal GMM cluster count using BIC."""
     n_samples = features.shape[0]
-    max_k = min(max_clusters, n_samples - 1)
-    if max_k < 2:
-        return 2
+    n_distinct = np.unique(features, axis=0).shape[0]
+    max_k = min(max_clusters, n_samples - 1, n_distinct)
 
     bics: List[Tuple[int, float]] = []
-    for k in range(2, max_k + 1):
+    for k in range(1, max_k + 1):
         try:
-            gmm = GaussianMixture(
-                n_components=k, random_state=random_state,
-                covariance_type="diag", reg_covar=1e-4,
-            )
-            gmm.fit(features)
-            bics.append((k, gmm.bic(features)))
-        except Exception:  # noqa: BLE001
+            with warnings.catch_warnings():
+                warnings.filterwarnings("error", category=ConvergenceWarning)
+                gmm = GaussianMixture(
+                    n_components=k, random_state=random_state,
+                    covariance_type="diag", reg_covar=1e-4,
+                )
+                gmm.fit(features)
+            bic = gmm.bic(features)
+            if np.isfinite(bic):
+                bics.append((k, bic))
+        except (ValueError, np.linalg.LinAlgError, ConvergenceWarning):
             continue
 
     if not bics:
-        return 2
+        raise ValueError("GMM source selection abstained: no valid clustering could be fitted")
     return min(bics, key=lambda x: x[1])[0]
 
 
@@ -196,8 +214,9 @@ def select_pretrain_models_gmm(
         target_model: Name of the target model.
         data_dir: Directory containing prediction CSVs.  Defaults to
             ``data/``.
-        reference_benchmarks: Benchmarks for clustering.  If ``None``,
-            auto-selected by category.
+        reference_benchmarks: Benchmarks for clustering. If ``None``, use all
+            available benchmarks except the target. The target benchmark is
+            always excluded, including when explicitly listed.
         n_clusters: Number of GMM clusters.  ``None`` → auto-select via BIC.
         random_state: Seed for GMM.
         verbose: Print selection details.
@@ -207,6 +226,11 @@ def select_pretrain_models_gmm(
         of the *target benchmark's* prediction CSV, and the corresponding
         model names.  These indices can be passed directly as
         ``pretrain_indices`` to :meth:`BQPriorSampler.sample`.
+
+    Raises:
+        ValueError: If the target cluster provides fewer than three source
+            models present in the target benchmark. Selection abstains rather
+            than substituting models from other clusters.
     """
     if data_dir is None:
         data_dir = _default_data_dir()
@@ -214,6 +238,9 @@ def select_pretrain_models_gmm(
     # Auto-select reference benchmarks if needed
     if reference_benchmarks is None:
         reference_benchmarks = get_reference_benchmarks(target_benchmark, data_dir)
+    reference_benchmarks = list(dict.fromkeys(
+        bench for bench in reference_benchmarks if bench != target_benchmark
+    ))
 
     # Filter to only benchmarks that actually have the target model's predictions
     filtered_refs: List[str] = []
@@ -240,6 +267,11 @@ def select_pretrain_models_gmm(
 
     # Build features from reference benchmarks
     features, ref_model_names = _build_features(reference_benchmarks, data_dir)
+    if len(ref_model_names) < 4:
+        raise ValueError(
+            "GMM source selection abstained: at least three source models "
+            "besides the target are required"
+        )
 
     if verbose:
         print(f"Models in references: {len(ref_model_names)}")
@@ -266,7 +298,15 @@ def select_pretrain_models_gmm(
         n_components=n_clusters, random_state=random_state,
         covariance_type="diag", reg_covar=1e-4,
     )
-    labels = gmm.fit_predict(features)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", category=ConvergenceWarning)
+            labels = gmm.fit_predict(features)
+    except (ValueError, np.linalg.LinAlgError, ConvergenceWarning) as exc:
+        raise ValueError(
+            "GMM source selection abstained: clustering could not be fitted "
+            "or did not converge"
+        ) from exc
     target_cluster = labels[target_ref_idx]
 
     # Models in same cluster (excluding target)
@@ -291,7 +331,7 @@ def select_pretrain_models_gmm(
         raise FileNotFoundError(f"Target predictions not found: {target_csv}")
     target_df = pd.read_csv(target_csv, nrows=0)  # header only
     target_model_cols = [c for c in target_df.columns if c.startswith("label_")]
-    target_model_names = [c.replace("label_", "") for c in target_model_cols]
+    target_model_names = [c[len("label_") :] for c in target_model_cols]
 
     pretrain_indices: List[int] = []
     pretrain_names: List[str] = []
@@ -302,19 +342,12 @@ def select_pretrain_models_gmm(
         elif verbose:
             print(f"  Warning: '{name}' not in target benchmark, skipping.")
 
-    if not pretrain_indices:
-        if verbose:
-            print("Warning: GMM selected no valid pretrain models. Falling back to all.")
-        # Fallback: use all models except target
-        fallback_target_idx = (
-            target_model_names.index(target_model)
-            if target_model in target_model_names
-            else 0
+    if len(pretrain_indices) < 3:
+        raise ValueError(
+            "GMM source selection abstained: target cluster provides "
+            f"{len(pretrain_indices)} source models present in {target_benchmark!r}; "
+            "at least three are required"
         )
-        pretrain_indices = [
-            i for i in range(len(target_model_names)) if i != fallback_target_idx
-        ]
-        pretrain_names = [target_model_names[i] for i in pretrain_indices]
 
     if verbose:
         print(f"\nFinal pretrain set ({len(pretrain_names)} models): {pretrain_names}")
