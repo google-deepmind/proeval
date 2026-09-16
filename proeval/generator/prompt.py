@@ -82,9 +82,9 @@ def format_hard_examples(hard_examples: List[Dict]) -> Tuple[str, float]:
     for i, ex in enumerate(hard_examples):
         pm = ex.get("prior_mean", 0.5)
         avg += pm
-        diff = "VERY HARD" if pm < 0.3 else "HARD" if pm < 0.5 else "MODERATE"
+        diff = "VERY HARD" if pm >= 0.7 else "HARD" if pm >= 0.5 else "MODERATE"
         ex_text += (
-            f"--- Example {i + 1} [{diff}, success rate: {pm:.1%}] ---\n"
+            f"--- Example {i + 1} [{diff}, predicted failure rate: {pm:.1%}] ---\n"
             f"Question: {ex['question']}\nAnswer: {ex['ground_truth']}\n\n"
         )
     if hard_examples:
@@ -120,7 +120,7 @@ def build_gsm8k_prompt(topic, hard_examples, strategy) -> str:
         return (
             "You are an expert Red-Teamer creating math problems AI models get WRONG.\n\n"
             f"=== HARD EXAMPLES ===\n{ex_text}"
-            f"Average model success rate: {avg:.1%}\n\n"
+            f"Average predicted failure rate: {avg:.1%}\n\n"
             "Generate ONE NEW math problem EQUALLY DIFFICULT or HARDER.\n\n"
             "Requirements:\n"
             "1. Mimic the reasoning pattern of the hard examples\n"
@@ -135,7 +135,7 @@ def build_gsm8k_prompt(topic, hard_examples, strategy) -> str:
     return (
         "You are an expert Red-Teamer creating math problems AI models get WRONG.\n\n"
         f"=== HARD EXAMPLES ===\n{ex_text}"
-        f"Average model success rate: {avg:.1%}\n\n"
+        f"Average predicted failure rate: {avg:.1%}\n\n"
         f"Generate ONE NEW math problem EQUALLY DIFFICULT or HARDER.\nTOPIC: {topic}\n\n"
         "Requirements:\n"
         "1. Mimic the reasoning pattern of the hard examples\n"
@@ -181,7 +181,7 @@ def build_strategyqa_prompt(topic, hard_examples, strategy) -> str:
         return (
             "You are an expert Red-Teamer creating yes/no questions AI models get WRONG.\n\n"
             f"=== HARD EXAMPLES (AI models failed on these) ===\n{ex_text}"
-            f"Average model success rate: {avg:.1%}\n\n"
+            f"Average predicted failure rate: {avg:.1%}\n\n"
             "Generate ONE NEW yes/no question EQUALLY DIFFICULT or HARDER.\n\n"
             "Requirements:\n"
             "1. Mimic the reasoning pattern of the hard examples\n"
@@ -196,7 +196,7 @@ def build_strategyqa_prompt(topic, hard_examples, strategy) -> str:
     return (
         "You are an expert Red-Teamer creating yes/no questions AI models get WRONG.\n\n"
         f"=== HARD EXAMPLES (AI models failed on these) ===\n{ex_text}"
-        f"Average model success rate: {avg:.1%}\n\n"
+        f"Average predicted failure rate: {avg:.1%}\n\n"
         f"Generate ONE NEW yes/no question EQUALLY DIFFICULT or HARDER.\n"
         f"TOPIC: {topic}\n\n"
         "Requirements:\n"
