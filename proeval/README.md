@@ -6,17 +6,16 @@ A Python library for efficient LLM evaluation through Bayesian Quadrature active
 
 ### Published release
 
-Install ProEval from [PyPI](https://pypi.org/project/proeval/). The current
-`0.1.0` release requires Python 3.10 or newer:
+Install ProEval (`0.1.1`, Python 3.9+) from [PyPI](https://pypi.org/project/proeval/):
 
 ```bash
 python -m pip install --upgrade proeval
-python -m pip install --upgrade "proeval[topic]"  # Optional topic generation
+python -m pip install --upgrade "proeval[encoder]"   # Optional: BQEncoderSampler and encoder training
+python -m pip install --upgrade "proeval[topics]"    # Optional: TopicAwareGenerator
+python -m pip install --upgrade "proeval[datasets]"  # Optional: evaluator.load_dataset_data
 ```
 
-The `0.1.0` package predates recent APIs documented in this guide, installs
-PyTorch as a core dependency, and does not include the repository's research
-data.
+Note that the PyPI package does not include the repository's research data under `data/`.
 
 ### Current `main`
 

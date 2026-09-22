@@ -18,17 +18,17 @@ Slash GenAI evaluation costs by up to 100x while actively discovering model fail
 
 ### Published release
 
-Install ProEval from [PyPI](https://pypi.org/project/proeval/). The current
-`0.1.0` release requires Python 3.10 or newer:
+Install ProEval (`0.1.1`, Python 3.9+) from [PyPI](https://pypi.org/project/proeval/):
 
 ```bash
 python -m pip install --upgrade proeval
-python -m pip install --upgrade "proeval[topic]"  # Optional topic generation
+python -m pip install --upgrade "proeval[encoder]"   # Optional: PyTorch — for BQEncoderSampler and encoder training
+python -m pip install --upgrade "proeval[topics]"    # Optional: BERTopic + HDBSCAN — for TopicAwareGenerator
+python -m pip install --upgrade "proeval[datasets]"  # Optional: HuggingFace datasets — for evaluator.load_dataset_data
+python -m pip install --upgrade "proeval[all]"       # Optional: everything above
 ```
 
-The `0.1.0` package predates recent API and sampling improvements on `main`,
-installs PyTorch as a core dependency, and does not include the repository's
-research data.
+Note that the PyPI package does not include the repository's ~381 MB research data under `data/`.
 
 ### Current `main`
 

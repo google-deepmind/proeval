@@ -36,7 +36,7 @@ Quick start::
     case = gen.generate(strategy="tss")
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from proeval.evaluator import (
     DATASET_CONFIGS,
